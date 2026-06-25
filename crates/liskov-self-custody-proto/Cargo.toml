@@ -1,0 +1,15 @@
+[package]
+name = "liskov-self-custody-proto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Strict JSON wire types for the Liskov self-custody signer websocket protocol."
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

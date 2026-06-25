@@ -1,0 +1,16 @@
+target/
+
+# Local editor and OS files
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local runtime/config material. Do not commit signer tokens or keystores.
+*.local
+*.secret
+*.key
+*.keystore
+.env
+.env.*
