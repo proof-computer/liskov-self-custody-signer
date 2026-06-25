@@ -4,6 +4,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 pub const PROTOCOL_VERSION: u16 = 1;
+pub const CHALLENGE_SIGNING_DOMAIN: &str = "proof.liskov.self-custody-signer.challenge.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
@@ -65,6 +66,22 @@ pub struct ChallengeResponse {
     pub request_id: String,
     pub address: String,
     pub signature: HexString,
+}
+
+pub fn challenge_signing_payload(challenge: &ServerChallenge, address: &str) -> Vec<u8> {
+    [
+        CHALLENGE_SIGNING_DOMAIN.to_string(),
+        format!("requestId:{}", challenge.request_id),
+        format!("nonce:{}", challenge.nonce.as_str()),
+        format!("issuedAtMs:{}", challenge.issued_at_ms),
+        format!("expiresAtMs:{}", challenge.expires_at_ms),
+        format!("organizationId:{}", challenge.context.organization_id),
+        format!("applicationId:{}", challenge.context.application_id),
+        format!("origin:{}", challenge.context.origin),
+        format!("address:{}", address.trim()),
+    ]
+    .join("\n")
+    .into_bytes()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -483,6 +500,37 @@ mod tests {
         let value = sign_request_value("acurast.register", "0x04010203", json!(1000));
 
         assert!(serde_json::from_value::<Envelope>(value).is_err());
+    }
+
+    #[test]
+    fn challenge_signing_payload_is_stable_and_address_bound() {
+        let challenge = ServerChallenge {
+            request_id: "req-challenge".to_owned(),
+            nonce: hex("0x00112233"),
+            issued_at_ms: 1_750_000_000_000,
+            expires_at_ms: 1_750_000_030_000,
+            context: ChallengeContext {
+                organization_id: "org_123".to_owned(),
+                application_id: "app_456".to_owned(),
+                origin: "https://liskov.proof.computer".to_owned(),
+            },
+        };
+
+        let payload =
+            String::from_utf8(challenge_signing_payload(&challenge, "  5FSignerAddress  "))
+                .expect("ascii payload");
+        assert_eq!(
+            payload,
+            "proof.liskov.self-custody-signer.challenge.v1\n\
+requestId:req-challenge\n\
+nonce:0x00112233\n\
+issuedAtMs:1750000000000\n\
+expiresAtMs:1750000030000\n\
+organizationId:org_123\n\
+applicationId:app_456\n\
+origin:https://liskov.proof.computer\n\
+address:5FSignerAddress"
+        );
     }
 
     fn hex(value: &str) -> HexString {
