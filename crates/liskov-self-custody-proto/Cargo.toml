@@ -9,6 +9,7 @@ description = "Strict JSON wire types for the Liskov self-custody signer websock
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

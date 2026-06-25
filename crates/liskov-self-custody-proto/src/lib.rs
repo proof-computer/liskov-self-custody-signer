@@ -1,6 +1,7 @@
 use std::{fmt, str::FromStr};
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use thiserror::Error;
 
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -137,6 +138,16 @@ pub enum Operation {
 pub struct SignResult {
     pub request_id: String,
     pub tx_hash: HexString,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalized_events: Option<Vec<ChainEvent>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChainEvent {
+    pub section: String,
+    pub method: String,
+    pub data: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -399,6 +410,11 @@ mod tests {
             Envelope::SignResult(SignResult {
                 request_id: "req-sign".to_owned(),
                 tx_hash: hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                finalized_events: Some(vec![ChainEvent {
+                    section: "acurast".to_owned(),
+                    method: "JobRegistrationStoredV2".to_owned(),
+                    data: json!([[{ "acurast": "5FSignerAddress" }, 42]]),
+                }]),
             }),
             Envelope::SignRejected(SignRejected {
                 request_id: "req-sign".to_owned(),
@@ -441,6 +457,77 @@ mod tests {
             "payload": {
                 "nowMs": 1750000010000_u64,
                 "extra": true
+            }
+        });
+
+        assert!(serde_json::from_value::<Envelope>(value).is_err());
+    }
+
+    #[test]
+    fn sign_result_accepts_tx_hash_without_finalized_events() {
+        let value = json!({
+            "type": "sign.result",
+            "payload": {
+                "requestId": "req-sign",
+                "txHash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+        });
+
+        let decoded = serde_json::from_value::<Envelope>(value).expect("tx-only result decodes");
+        let Envelope::SignResult(result) = decoded else {
+            panic!("expected sign result");
+        };
+        assert_eq!(result.request_id, "req-sign");
+        assert_eq!(result.finalized_events, None);
+    }
+
+    #[test]
+    fn sign_result_round_trips_finalized_events() {
+        let value = json!({
+            "type": "sign.result",
+            "payload": {
+                "requestId": "req-sign",
+                "txHash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "finalizedEvents": [{
+                    "section": "acurast",
+                    "method": "JobRegistrationStoredV2",
+                    "data": [[{ "acurast": "5FSignerAddress" }, 42]]
+                }]
+            }
+        });
+
+        let decoded = serde_json::from_value::<Envelope>(value).expect("result decodes");
+        let encoded = serde_json::to_value(&decoded).expect("result encodes");
+        assert_eq!(
+            encoded,
+            json!({
+                "type": "sign.result",
+                "payload": {
+                    "requestId": "req-sign",
+                    "txHash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "finalizedEvents": [{
+                        "section": "acurast",
+                        "method": "JobRegistrationStoredV2",
+                        "data": [[{ "acurast": "5FSignerAddress" }, 42]]
+                    }]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn sign_result_rejects_unknown_finalized_event_fields() {
+        let value = json!({
+            "type": "sign.result",
+            "payload": {
+                "requestId": "req-sign",
+                "txHash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "finalizedEvents": [{
+                    "section": "acurast",
+                    "method": "JobRegistrationStoredV2",
+                    "data": [],
+                    "extra": true
+                }]
             }
         });
 
