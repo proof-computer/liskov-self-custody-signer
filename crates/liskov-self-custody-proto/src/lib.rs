@@ -14,6 +14,8 @@ pub enum Envelope {
     ClientHello(ClientHello),
     #[serde(rename = "server.challenge")]
     ServerChallenge(ServerChallenge),
+    #[serde(rename = "server.ready")]
+    ServerReady(ServerReady),
     #[serde(rename = "client.challengeResponse")]
     ChallengeResponse(ChallengeResponse),
     #[serde(rename = "sign.request")]
@@ -67,6 +69,15 @@ pub struct ChallengeResponse {
     pub request_id: String,
     pub address: String,
     pub signature: HexString,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ServerReady {
+    pub organization_id: String,
+    pub application_id: String,
+    pub address: String,
+    pub protocol_version: u16,
 }
 
 pub fn challenge_signing_payload(challenge: &ServerChallenge, address: &str) -> Vec<u8> {
@@ -382,6 +393,12 @@ mod tests {
                 request_id: "req-challenge".to_owned(),
                 address: "5FSignerAddress".to_owned(),
                 signature: hex("0xaabbccdd"),
+            }),
+            Envelope::ServerReady(ServerReady {
+                organization_id: "org_123".to_owned(),
+                application_id: "app_456".to_owned(),
+                address: "5FSignerAddress".to_owned(),
+                protocol_version: PROTOCOL_VERSION,
             }),
             Envelope::SignRequest(SignRequest {
                 request_id: "req-sign".to_owned(),

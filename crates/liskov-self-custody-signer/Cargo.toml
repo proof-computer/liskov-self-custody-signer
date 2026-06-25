@@ -5,11 +5,29 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Placeholder daemon binary for the Liskov self-custody signer."
+description = "User-run Liskov self-custody signer daemon."
 
 [dependencies]
+aes-gcm.workspace = true
+argon2.workspace = true
+async-trait.workspace = true
+blake2.workspace = true
+bs58.workspace = true
 clap.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hex.workspace = true
 liskov-self-custody-proto = { path = "../liskov-self-custody-proto" }
+schnorrkel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+subxt.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+url.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 clap.workspace = true
+tempfile.workspace = true
