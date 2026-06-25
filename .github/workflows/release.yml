@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+            bin_ext: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+            bin_ext: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+            bin_ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+            bin_ext: .exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin liskov-self-custody-signer --target ${{ matrix.target }}
+
+      - name: Package archive
+        shell: python
+        env:
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+          BIN_EXT: ${{ matrix.bin_ext }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          import os
+          import shutil
+          import tarfile
+          import zipfile
+
+          archive_ext = os.environ["ARCHIVE_EXT"]
+          bin_ext = os.environ["BIN_EXT"]
+          target = os.environ["TARGET"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          name = f"liskov-self-custody-signer-{tag}-{target}"
+          root = os.path.join("dist", name)
+
+          os.makedirs(root, exist_ok=True)
+          shutil.copy2(
+              os.path.join("target", target, "release", f"liskov-self-custody-signer{bin_ext}"),
+              root,
+          )
+          for path in ("README.md", "LICENSE"):
+              shutil.copy2(path, root)
+
+          archive_path = os.path.join("dist", f"{name}.{archive_ext}")
+          if archive_ext == "zip":
+              with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                  for dirpath, _dirnames, filenames in os.walk(root):
+                      for filename in filenames:
+                          path = os.path.join(dirpath, filename)
+                          archive.write(path, os.path.relpath(path, "dist"))
+          else:
+              with tarfile.open(archive_path, "w:gz") as archive:
+                  archive.add(root, arcname=name)
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: liskov-self-custody-signer-${{ github.ref_name }}-${{ matrix.target }}
+          path: dist/liskov-self-custody-signer-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes --verify-tag
+          fi
