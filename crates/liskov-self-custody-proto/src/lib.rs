@@ -178,6 +178,8 @@ pub enum SignRejectionReason {
     MetadataMismatch,
     #[serde(rename = "rewardCapExceeded")]
     RewardCapExceeded,
+    #[serde(rename = "insufficient_acu_balance")]
+    InsufficientAcuBalance,
     #[serde(rename = "invalidCallBytes")]
     InvalidCallBytes,
     #[serde(rename = "userRejected")]

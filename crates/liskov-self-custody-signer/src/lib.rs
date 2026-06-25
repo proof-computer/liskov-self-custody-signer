@@ -42,10 +42,13 @@ const KEYSTORE_PATH_ENV: &str = "LISKOV_SIGNER_KEYSTORE";
 const ACURAST_RPC_URL_ENV: &str = "LISKOV_SIGNER_ACURAST_RPC_URL";
 const ACURAST_RPC_BEARER_TOKEN_ENV: &str = "PROOF_ACURAST_RPC_BEARER_TOKEN";
 const MAX_REWARD_ENV: &str = "LISKOV_SIGNER_MAX_REWARD_PER_REQUEST_PLANCK";
+const TX_FEE_BUFFER_PLANCK_ENV: &str = "LISKOV_SIGNER_TX_FEE_BUFFER_PLANCK";
 const SPEND_WINDOW_PLANCK_ENV: &str = "LISKOV_SIGNER_SPEND_WINDOW_PLANCK";
 const SPEND_WINDOW_SECONDS_ENV: &str = "LISKOV_SIGNER_SPEND_WINDOW_SECONDS";
 const SS58_FORMAT_ENV: &str = "LISKOV_SIGNER_SS58_FORMAT";
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const INSUFFICIENT_ACU_BALANCE_MESSAGE: &str =
+    "Fund the self-custody address with enough ACU to cover the deployment reward and transaction fee buffer, then retry.";
 
 #[derive(Clone, Parser, PartialEq, Eq)]
 #[command(
@@ -73,6 +76,8 @@ pub struct Cli {
     pub ss58_format: Option<u16>,
     #[arg(long, value_name = "PLANCK")]
     pub max_reward_per_request_planck: Option<u128>,
+    #[arg(long, value_name = "PLANCK")]
+    pub tx_fee_buffer_planck: Option<u128>,
     #[arg(long, value_name = "PLANCK")]
     pub spend_window_planck: Option<u128>,
     #[arg(long, value_name = "SECONDS")]
@@ -127,6 +132,7 @@ impl fmt::Debug for Cli {
                 "max_reward_per_request_planck",
                 &self.max_reward_per_request_planck,
             )
+            .field("tx_fee_buffer_planck", &self.tx_fee_buffer_planck)
             .field("spend_window_planck", &self.spend_window_planck)
             .field("spend_window_seconds", &self.spend_window_seconds)
             .field(
@@ -141,7 +147,7 @@ impl fmt::Display for Cli {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "config={}, controlPlaneUrl={}, pairingToken={}, keystorePath={}, acurastRpcUrl={}, acurastRpcBearerToken={}, ss58Format={}, maxRewardPerRequestPlanck={}, spendWindowPlanck={}, spendWindowSeconds={}, keystorePassphrase={}",
+            "config={}, controlPlaneUrl={}, pairingToken={}, keystorePath={}, acurastRpcUrl={}, acurastRpcBearerToken={}, ss58Format={}, maxRewardPerRequestPlanck={}, txFeeBufferPlanck={}, spendWindowPlanck={}, spendWindowSeconds={}, keystorePassphrase={}",
             display_path(self.config.as_ref()),
             display_option(self.control_plane_url.as_deref()),
             redacted(self.pairing_token.as_deref()),
@@ -151,6 +157,11 @@ impl fmt::Display for Cli {
             display_option(self.ss58_format.map(|value| value.to_string()).as_deref()),
             display_option(
                 self.max_reward_per_request_planck
+                    .map(|value| value.to_string())
+                    .as_deref()
+            ),
+            display_option(
+                self.tx_fee_buffer_planck
                     .map(|value| value.to_string())
                     .as_deref()
             ),
@@ -414,6 +425,7 @@ where
             .await
             .map_err(|error| Rejection::signing_unavailable(&error))?;
         let verified = verify_sign_request(request, &runtime)?;
+        self.ensure_acu_balance_preflight(&verified).await?;
         if let Some(reward) = verified.reward_planck {
             self.spend
                 .reserve(&request.request_id, reward, now_epoch_seconds())
@@ -443,6 +455,39 @@ where
             },
         })
     }
+
+    async fn ensure_acu_balance_preflight(&self, verified: &VerifiedCall) -> Result<(), Rejection> {
+        let required = match verified.operation {
+            Operation::AcurastRegister | Operation::AcurastMarketplaceDeploy => verified
+                .reward_planck
+                .ok_or_else(|| {
+                    Rejection::new(
+                        SignRejectionReason::InvalidCallBytes,
+                        "register/deploy call did not expose a reward",
+                    )
+                })?
+                .checked_add(self.config.tx_fee_buffer_planck)
+                .ok_or_else(|| {
+                    Rejection::signing_unavailable("ACU balance preflight overflowed")
+                })?,
+            Operation::AcurastSetEnvironments | Operation::AcurastDeregister => {
+                self.config.tx_fee_buffer_planck
+            }
+        };
+        let free = self
+            .chain
+            .free_balance_planck(&self.signer.account_id())
+            .await
+            .map_err(|error| Rejection::signing_unavailable(&error))?
+            .unwrap_or(0);
+        if free == 0 || free < required {
+            return Err(Rejection::new(
+                SignRejectionReason::InsufficientAcuBalance,
+                INSUFFICIENT_ACU_BALANCE_MESSAGE,
+            ));
+        }
+        Ok(())
+    }
 }
 
 async fn send_envelope<S>(socket: &mut S, envelope: &Envelope) -> Result<(), SignerError>
@@ -465,6 +510,7 @@ pub struct RunConfig {
     pub acurast_rpc_bearer_token: Option<String>,
     pub ss58_format: u16,
     pub max_reward_per_request_planck: u128,
+    pub tx_fee_buffer_planck: u128,
     pub spend_window_planck: u128,
     pub spend_window_seconds: u64,
     pub keystore_passphrase: SecretString,
@@ -481,6 +527,7 @@ struct FileConfig {
     acurast_rpc_bearer_token: Option<String>,
     ss58_format: Option<u16>,
     max_reward_per_request_planck: Option<u128>,
+    tx_fee_buffer_planck: Option<u128>,
     spend_window_planck: Option<u128>,
     spend_window_seconds: Option<u64>,
 }
@@ -518,6 +565,15 @@ impl RunConfig {
             .ok_or_else(|| {
                 SignerError::Config("maxRewardPerRequestPlanck is required".to_string())
             })?;
+        let tx_fee_buffer_planck = cli
+            .tx_fee_buffer_planck
+            .or(file.tx_fee_buffer_planck)
+            .ok_or_else(|| SignerError::Config("txFeeBufferPlanck is required".to_string()))?;
+        if tx_fee_buffer_planck == 0 {
+            return Err(SignerError::Config(
+                "txFeeBufferPlanck must be greater than zero".to_string(),
+            ));
+        }
         let spend_window_planck = cli
             .spend_window_planck
             .or(file.spend_window_planck)
@@ -554,6 +610,7 @@ impl RunConfig {
                 .or(file.ss58_format)
                 .unwrap_or(DEFAULT_SS58_FORMAT),
             max_reward_per_request_planck,
+            tx_fee_buffer_planck,
             spend_window_planck,
             spend_window_seconds,
             keystore_passphrase,
@@ -587,6 +644,9 @@ fn apply_env(file: &mut FileConfig) -> Result<(), SignerError> {
     }
     if let Ok(value) = std::env::var(MAX_REWARD_ENV) {
         file.max_reward_per_request_planck = Some(parse_env(value, MAX_REWARD_ENV)?);
+    }
+    if let Ok(value) = std::env::var(TX_FEE_BUFFER_PLANCK_ENV) {
+        file.tx_fee_buffer_planck = Some(parse_env(value, TX_FEE_BUFFER_PLANCK_ENV)?);
     }
     if let Ok(value) = std::env::var(SPEND_WINDOW_PLANCK_ENV) {
         file.spend_window_planck = Some(parse_env(value, SPEND_WINDOW_PLANCK_ENV)?);
@@ -833,6 +893,10 @@ impl LocalSr25519Signer {
         &self.address
     }
 
+    fn account_id(&self) -> AccountId32 {
+        self.account.clone()
+    }
+
     fn sign_bytes(&self, payload: &[u8]) -> Result<[u8; 64], SignerError> {
         sign_sr25519(&self.seed.0, payload)
     }
@@ -1020,6 +1084,7 @@ pub struct SubmittedTransaction {
 #[async_trait]
 pub trait AcurastClient: Send + Sync {
     async fn runtime_snapshot(&self) -> Result<RuntimeSnapshot, String>;
+    async fn free_balance_planck(&self, account: &AccountId32) -> Result<Option<u128>, String>;
     async fn submit_call(
         &self,
         call_bytes: &[u8],
@@ -1064,6 +1129,33 @@ impl AcurastClient for LiveAcurastClient {
         })
     }
 
+    async fn free_balance_planck(&self, account: &AccountId32) -> Result<Option<u128>, String> {
+        let query = subxt::dynamic::storage(
+            "System",
+            "Account",
+            vec![subxt::dynamic::Value::from_bytes(account.0)],
+        );
+        let storage = self
+            .client
+            .storage()
+            .at_latest()
+            .await
+            .map_err(|error| format!("storage at_latest failed: {error}"))?;
+        let Some(entry) = storage
+            .fetch(&query)
+            .await
+            .map_err(|error| format!("System.Account fetch failed: {error}"))?
+        else {
+            return Ok(None);
+        };
+        let decoded = entry
+            .to_value()
+            .map_err(|error| format!("decode System.Account failed: {error}"))?;
+        account_data_free_planck(&decoded)
+            .ok_or_else(|| "System.Account.data.free not found or not a u128".to_string())
+            .map(Some)
+    }
+
     async fn submit_call(
         &self,
         call_bytes: &[u8],
@@ -1097,6 +1189,26 @@ impl AcurastClient for LiveAcurastClient {
             finalized_events,
             finalized_at_epoch_seconds: now_epoch_seconds(),
         })
+    }
+}
+
+fn account_data_free_planck(account: &subxt::ext::scale_value::Value<u32>) -> Option<u128> {
+    use subxt::ext::scale_value::{Composite, Primitive, ValueDef};
+    fn named<'a>(
+        value: &'a subxt::ext::scale_value::Value<u32>,
+        field: &str,
+    ) -> Option<&'a subxt::ext::scale_value::Value<u32>> {
+        match &value.value {
+            ValueDef::Composite(Composite::Named(fields)) => {
+                fields.iter().find(|(key, _)| key == field).map(|(_, v)| v)
+            }
+            _ => None,
+        }
+    }
+    let free = named(named(account, "data")?, "free")?;
+    match &free.value {
+        ValueDef::Primitive(Primitive::U128(value)) => Some(*value),
+        _ => None,
     }
 }
 
@@ -1490,9 +1602,93 @@ fn positional(value: Value) -> Value {
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     fn seed_hex(byte: u8) -> String {
         format!("0x{}", hex::encode([byte; 32]))
+    }
+
+    struct FakeAcurastClient {
+        free_balance: Option<u128>,
+        submit_count: Arc<AtomicUsize>,
+    }
+
+    impl FakeAcurastClient {
+        fn new(free_balance: Option<u128>) -> Self {
+            Self {
+                free_balance,
+                submit_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AcurastClient for FakeAcurastClient {
+        async fn runtime_snapshot(&self) -> Result<RuntimeSnapshot, String> {
+            Err("runtime snapshot not configured for this test".to_string())
+        }
+
+        async fn free_balance_planck(
+            &self,
+            _account: &AccountId32,
+        ) -> Result<Option<u128>, String> {
+            Ok(self.free_balance)
+        }
+
+        async fn submit_call(
+            &self,
+            _call_bytes: &[u8],
+            _signer: &LocalSr25519Signer,
+        ) -> Result<SubmittedTransaction, String> {
+            self.submit_count.fetch_add(1, Ordering::SeqCst);
+            Ok(SubmittedTransaction {
+                tx_hash: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+                finalized_events: Vec::new(),
+                finalized_at_epoch_seconds: 1,
+            })
+        }
+    }
+
+    fn test_runtime_with_free_balance(
+        dir: &Path,
+        free_balance: Option<u128>,
+        fee_buffer: u128,
+    ) -> DaemonRuntime<FakeAcurastClient> {
+        let keystore_path = dir.join("signer.json");
+        let signer = LocalSr25519Signer::from_seed(
+            SigningSeed::from_seed_hex(&seed_hex(7)).expect("seed"),
+            DEFAULT_SS58_FORMAT,
+        )
+        .expect("signer");
+        let spend_limits = SpendLimits {
+            max_reward_per_request_planck: 1_000,
+            spend_window_planck: 2_000,
+            spend_window_seconds: 60,
+        };
+        DaemonRuntime {
+            config: RunConfig {
+                control_plane_url: "wss://liskov.test/api/custody/signer".to_string(),
+                pairing_token: None,
+                keystore_path: keystore_path.clone(),
+                ready_path: ready_binding_path(&keystore_path),
+                acurast_rpc_url: DEFAULT_ACURAST_RPC_URL.to_string(),
+                acurast_rpc_bearer_token: None,
+                ss58_format: DEFAULT_SS58_FORMAT,
+                max_reward_per_request_planck: spend_limits.max_reward_per_request_planck,
+                tx_fee_buffer_planck: fee_buffer,
+                spend_window_planck: spend_limits.spend_window_planck,
+                spend_window_seconds: spend_limits.spend_window_seconds,
+                keystore_passphrase: SecretString("test-passphrase".to_string()),
+                spend_limits,
+            },
+            signer,
+            spend: SpendLedger::new(spend_ledger_path(&keystore_path), spend_limits),
+            chain: FakeAcurastClient::new(free_balance),
+        }
     }
 
     #[test]
@@ -1516,6 +1712,8 @@ mod tests {
             "rpc-secret",
             "--max-reward-per-request-planck",
             "10",
+            "--tx-fee-buffer-planck",
+            "1",
             "--spend-window-planck",
             "20",
             "--spend-window-seconds",
@@ -1594,6 +1792,71 @@ mod tests {
         assert!(ledger.reserve("r4", 11, 112).is_err());
     }
 
+    #[tokio::test]
+    async fn acu_balance_preflight_rejects_insufficient_register_balance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime_with_free_balance(dir.path(), Some(1_009), 10);
+        let rejected = runtime
+            .ensure_acu_balance_preflight(&VerifiedCall {
+                operation: Operation::AcurastRegister,
+                reward_planck: Some(1_000),
+                call_bytes: vec![1, 2, 3],
+            })
+            .await
+            .expect_err("insufficient balance rejected");
+
+        assert_eq!(rejected.reason, SignRejectionReason::InsufficientAcuBalance);
+        assert_eq!(
+            rejected.message.as_deref(),
+            Some(INSUFFICIENT_ACU_BALANCE_MESSAGE)
+        );
+        assert_eq!(
+            runtime.chain.submit_count.load(Ordering::SeqCst),
+            0,
+            "preflight must not submit a call"
+        );
+    }
+
+    #[tokio::test]
+    async fn acu_balance_preflight_accepts_reward_plus_fee_buffer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime_with_free_balance(dir.path(), Some(1_010), 10);
+
+        runtime
+            .ensure_acu_balance_preflight(&VerifiedCall {
+                operation: Operation::AcurastMarketplaceDeploy,
+                reward_planck: Some(1_000),
+                call_bytes: vec![1, 2, 3],
+            })
+            .await
+            .expect("reward plus fee buffer accepted");
+    }
+
+    #[tokio::test]
+    async fn acu_balance_preflight_requires_fee_buffer_for_environment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let zero = test_runtime_with_free_balance(dir.path(), Some(0), 10);
+        let rejected = zero
+            .ensure_acu_balance_preflight(&VerifiedCall {
+                operation: Operation::AcurastSetEnvironments,
+                reward_planck: None,
+                call_bytes: vec![1, 2, 3],
+            })
+            .await
+            .expect_err("zero balance rejected");
+        assert_eq!(rejected.reason, SignRejectionReason::InsufficientAcuBalance);
+
+        let enough = test_runtime_with_free_balance(dir.path(), Some(10), 10);
+        enough
+            .ensure_acu_balance_preflight(&VerifiedCall {
+                operation: Operation::AcurastDeregister,
+                reward_planck: None,
+                call_bytes: vec![1, 2, 3],
+            })
+            .await
+            .expect("fee buffer accepted for non-reward operation");
+    }
+
     #[test]
     fn reward_search_finds_nested_reward() {
         let value = json!([{
@@ -1638,5 +1901,46 @@ mod tests {
         ]);
         let error = RunConfig::from_cli_env_and_file(&cli).expect_err("missing caps");
         assert!(error.to_string().contains("maxRewardPerRequestPlanck"));
+    }
+
+    #[test]
+    fn config_requires_positive_fee_buffer() {
+        let missing = Cli::parse_from([
+            "liskov-self-custody-signer",
+            "--control-plane-url",
+            "wss://liskov.proof.computer/api/custody/signer",
+            "--keystore-path",
+            "signer.json",
+            "--keystore-passphrase",
+            "secret",
+            "--max-reward-per-request-planck",
+            "10",
+            "--spend-window-planck",
+            "20",
+            "--spend-window-seconds",
+            "60",
+        ]);
+        let error = RunConfig::from_cli_env_and_file(&missing).expect_err("missing fee buffer");
+        assert!(error.to_string().contains("txFeeBufferPlanck"));
+
+        let zero = Cli::parse_from([
+            "liskov-self-custody-signer",
+            "--control-plane-url",
+            "wss://liskov.proof.computer/api/custody/signer",
+            "--keystore-path",
+            "signer.json",
+            "--keystore-passphrase",
+            "secret",
+            "--max-reward-per-request-planck",
+            "10",
+            "--tx-fee-buffer-planck",
+            "0",
+            "--spend-window-planck",
+            "20",
+            "--spend-window-seconds",
+            "60",
+        ]);
+        let error = RunConfig::from_cli_env_and_file(&zero).expect_err("zero fee buffer");
+        assert!(error.to_string().contains("greater than zero"));
     }
 }

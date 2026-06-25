@@ -34,6 +34,7 @@ liskov-self-custody-signer \
   --pairing-token <token> \
   --keystore-path signer-keystore.json \
   --max-reward-per-request-planck 1000000000000 \
+  --tx-fee-buffer-planck 100000000 \
   --spend-window-planck 5000000000000 \
   --spend-window-seconds 86400
 ```
@@ -46,7 +47,7 @@ Config can also be supplied as JSON via `--config`. CLI flags override
 environment variables, which override config-file values. Supported fields are
 `controlPlaneUrl`, `pairingToken`, `keystorePath`, `acurastRpcUrl`,
 `acurastRpcBearerToken`, `ss58Format`, `maxRewardPerRequestPlanck`,
-`spendWindowPlanck`, and `spendWindowSeconds`.
+`txFeeBufferPlanck`, `spendWindowPlanck`, and `spendWindowSeconds`.
 
 Relevant environment variables:
 
@@ -58,11 +59,13 @@ Relevant environment variables:
 - `PROOF_ACURAST_RPC_BEARER_TOKEN`
 - `LISKOV_SIGNER_SS58_FORMAT`
 - `LISKOV_SIGNER_MAX_REWARD_PER_REQUEST_PLANCK`
+- `LISKOV_SIGNER_TX_FEE_BUFFER_PLANCK`
 - `LISKOV_SIGNER_SPEND_WINDOW_PLANCK`
 - `LISKOV_SIGNER_SPEND_WINDOW_SECONDS`
 
-Reward caps are required at startup. Spend reservations are persisted beside the
-keystore before signing so restarts do not reset the local rolling cap.
+Reward caps and a positive transaction-fee buffer are required at startup. Spend
+reservations are persisted beside the keystore before signing so restarts do not
+reset the local rolling cap.
 
 ## Verification
 
@@ -79,6 +82,12 @@ accepts only:
 `Balances::transfer` and all other value-movement calls are deliberately
 excluded. `register` and `deploy` must also fit the request cap, the local
 per-request cap, and the local rolling spend window.
+
+Before submitting, the daemon checks the signer's Acurast free balance. For
+`register` and marketplace `deploy`, free balance must cover the decoded reward
+plus `txFeeBufferPlanck`. For `setEnvironments` and `deregister`, free balance
+must cover the same fee buffer. Insufficient balance is rejected locally as
+`insufficient_acu_balance`; no extrinsic is submitted.
 
 ## Validation
 
