@@ -17,8 +17,9 @@ use clap::{Args, Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use liskov_self_custody_proto::{
     challenge_signing_payload, AcurastRuntimeMetadata, ChainEvent, ChallengeResponse, ClientHello,
-    Envelope, HexString, Operation, ServerReady, SignRejected, SignRejectionReason, SignRequest,
-    SignResult, SignerCapability, PROTOCOL_VERSION,
+    Envelope, HexString, Operation, SecretSyncRejected, SecretSyncRejectionReason,
+    SecretSyncRequest, ServerReady, SignRejected, SignRejectionReason, SignRequest, SignResult,
+    SignerCapability, PROTOCOL_VERSION,
 };
 use schnorrkel::{ExpansionMode, MiniSecretKey};
 use serde::{Deserialize, Serialize};
@@ -48,7 +49,8 @@ const SPEND_WINDOW_SECONDS_ENV: &str = "LISKOV_SIGNER_SPEND_WINDOW_SECONDS";
 const SS58_FORMAT_ENV: &str = "LISKOV_SIGNER_SS58_FORMAT";
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const INSUFFICIENT_ACU_BALANCE_MESSAGE: &str =
-    "Fund the self-custody address with enough ACU to cover the deployment reward and transaction fee buffer, then retry.";
+    "Fund the self-custody address with enough ACU to cover total deployment reward escrow and the transaction fee buffer, then retry.";
+const SECRET_SYNC_UNAVAILABLE_MESSAGE: &str = "Secret sync is not available in this signer build.";
 
 #[derive(Clone, Parser, PartialEq, Eq)]
 #[command(
@@ -299,7 +301,7 @@ where
                 protocol_version: PROTOCOL_VERSION,
                 signer_version: env!("CARGO_PKG_VERSION").to_string(),
                 address: self.signer.address().to_string(),
-                capabilities: vec![SignerCapability::SignDeployLifecycle],
+                capabilities: advertised_capabilities(),
             }),
         )
         .await?;
@@ -331,6 +333,10 @@ where
                     }
                     Ok(Envelope::SignRequest(request)) => {
                         let response = self.handle_sign_request(request).await;
+                        send_envelope(&mut socket, &response).await?;
+                    }
+                    Ok(Envelope::SecretSyncRequest(request)) => {
+                        let response = self.handle_secret_sync_request(request);
                         send_envelope(&mut socket, &response).await?;
                     }
                     Ok(Envelope::Heartbeat(heartbeat)) => {
@@ -418,6 +424,14 @@ where
         }
     }
 
+    fn handle_secret_sync_request(&self, request: SecretSyncRequest) -> Envelope {
+        Envelope::SecretSyncRejected(SecretSyncRejected {
+            request_id: request.request_id,
+            reason: SecretSyncRejectionReason::SecretSyncUnavailable,
+            message: Some(SECRET_SYNC_UNAVAILABLE_MESSAGE.to_string()),
+        })
+    }
+
     async fn verify_reserve_submit(&self, request: &SignRequest) -> Result<SignResult, Rejection> {
         let runtime = self
             .chain
@@ -426,9 +440,9 @@ where
             .map_err(|error| Rejection::signing_unavailable(&error))?;
         let verified = verify_sign_request(request, &runtime)?;
         self.ensure_acu_balance_preflight(&verified).await?;
-        if let Some(reward) = verified.reward_planck {
+        if let Some(reward_escrow) = verified.reward_escrow_planck {
             self.spend
-                .reserve(&request.request_id, reward, now_epoch_seconds())
+                .reserve(&request.request_id, reward_escrow, now_epoch_seconds())
                 .map_err(|error| Rejection::new(SignRejectionReason::RewardCapExceeded, error))?;
         }
         let submitted = self
@@ -436,7 +450,7 @@ where
             .submit_call(&verified.call_bytes, &self.signer)
             .await
             .map_err(|error| Rejection::signing_unavailable(&error))?;
-        if verified.reward_planck.is_some() {
+        if verified.reward_escrow_planck.is_some() {
             self.spend
                 .confirm(&request.request_id, submitted.finalized_at_epoch_seconds)
                 .map_err(|error| Rejection::signing_unavailable(&error))?;
@@ -459,11 +473,11 @@ where
     async fn ensure_acu_balance_preflight(&self, verified: &VerifiedCall) -> Result<(), Rejection> {
         let required = match verified.operation {
             Operation::AcurastRegister | Operation::AcurastMarketplaceDeploy => verified
-                .reward_planck
+                .reward_escrow_planck
                 .ok_or_else(|| {
                     Rejection::new(
                         SignRejectionReason::InvalidCallBytes,
-                        "register/deploy call did not expose a reward",
+                        "register/deploy call did not expose reward escrow",
                     )
                 })?
                 .checked_add(self.config.tx_fee_buffer_planck)
@@ -488,6 +502,13 @@ where
         }
         Ok(())
     }
+}
+
+fn advertised_capabilities() -> Vec<SignerCapability> {
+    vec![
+        SignerCapability::SignDeployLifecycle,
+        SignerCapability::PrepareLiskovSecretsFromSecretSources,
+    ]
 }
 
 async fn send_envelope<S>(socket: &mut S, envelope: &Envelope) -> Result<(), SignerError>
@@ -997,7 +1018,7 @@ impl SpendLedger {
 
     pub fn reserve(&self, request_id: &str, amount: u128, now_seconds: u64) -> Result<(), String> {
         if amount > self.limits.max_reward_per_request_planck {
-            return Err("reward exceeds maxRewardPerRequestPlanck".to_string());
+            return Err("reward escrow exceeds maxRewardPerRequestPlanck".to_string());
         }
         let mut ledger = self.load().map_err(|error| error.to_string())?;
         prune_spend_ledger(&mut ledger, self.limits.spend_window_seconds, now_seconds);
@@ -1011,7 +1032,7 @@ impl SpendLedger {
             .checked_add(amount)
             .ok_or_else(|| "spend window total overflowed".to_string())?;
         if next > self.limits.spend_window_planck {
-            return Err("reward exceeds rolling spend window".to_string());
+            return Err("reward escrow exceeds rolling spend window".to_string());
         }
         if ledger
             .reservations
@@ -1229,6 +1250,8 @@ impl Payload for RawCallPayload {
 pub struct VerifiedCall {
     pub operation: Operation,
     pub reward_planck: Option<u128>,
+    pub slots: Option<u128>,
+    pub reward_escrow_planck: Option<u128>,
     pub call_bytes: Vec<u8>,
 }
 
@@ -1246,25 +1269,48 @@ pub fn verify_sign_request(
             "decoded operation does not match request context",
         ));
     }
-    let reward_planck = match decoded.operation {
+    let (reward_planck, slots, reward_escrow_planck) = verify_reward_terms(
+        decoded.operation,
+        decoded.reward_planck,
+        decoded.slots,
+        request
+            .context
+            .max_reward_planck
+            .as_ref()
+            .map(|cap| cap.as_str()),
+    )?;
+    Ok(VerifiedCall {
+        operation: decoded.operation,
+        reward_planck,
+        slots,
+        reward_escrow_planck,
+        call_bytes,
+    })
+}
+
+type VerifiedRewardTerms = (Option<u128>, Option<u128>, Option<u128>);
+
+fn verify_reward_terms(
+    operation: Operation,
+    decoded_reward_planck: Option<u128>,
+    decoded_slots: Option<u128>,
+    request_cap_planck: Option<&str>,
+) -> Result<VerifiedRewardTerms, Rejection> {
+    match operation {
         Operation::AcurastRegister | Operation::AcurastMarketplaceDeploy => {
-            let reward = decoded.reward_planck.ok_or_else(|| {
+            let reward = decoded_reward_planck.ok_or_else(|| {
                 Rejection::new(
                     SignRejectionReason::InvalidCallBytes,
                     "register/deploy call did not expose a reward",
                 )
             })?;
-            let request_cap = request
-                .context
-                .max_reward_planck
-                .as_ref()
+            let request_cap = request_cap_planck
                 .ok_or_else(|| {
                     Rejection::new(
                         SignRejectionReason::RewardCapExceeded,
                         "request is missing maxRewardPlanck",
                     )
                 })?
-                .as_str()
                 .parse::<u128>()
                 .map_err(|_| {
                     Rejection::new(
@@ -1278,15 +1324,22 @@ pub fn verify_sign_request(
                     "decoded reward exceeds request maxRewardPlanck",
                 ));
             }
-            Some(reward)
+            let slots = decoded_slots.ok_or_else(|| {
+                Rejection::new(
+                    SignRejectionReason::InvalidCallBytes,
+                    "register/deploy call did not expose slots",
+                )
+            })?;
+            let reward_escrow = reward.checked_mul(slots).ok_or_else(|| {
+                Rejection::new(
+                    SignRejectionReason::InvalidCallBytes,
+                    "decoded reward escrow overflowed",
+                )
+            })?;
+            Ok((Some(reward), Some(slots), Some(reward_escrow)))
         }
-        Operation::AcurastSetEnvironments | Operation::AcurastDeregister => None,
-    };
-    Ok(VerifiedCall {
-        operation: decoded.operation,
-        reward_planck,
-        call_bytes,
-    })
+        Operation::AcurastSetEnvironments | Operation::AcurastDeregister => Ok((None, None, None)),
+    }
 }
 
 fn compare_runtime_metadata(
@@ -1363,6 +1416,7 @@ pub struct DecodedCall {
     pub pallet: String,
     pub call: String,
     pub reward_planck: Option<u128>,
+    pub slots: Option<u128>,
 }
 
 pub fn decode_call(metadata: &Metadata, call_bytes: &[u8]) -> Result<DecodedCall, Rejection> {
@@ -1413,6 +1467,7 @@ pub fn decode_call(metadata: &Metadata, call_bytes: &[u8]) -> Result<DecodedCall
         pallet: pallet.name().to_string(),
         call: call.name.to_string(),
         reward_planck: reward_from_decoded_call(&json),
+        slots: slots_from_decoded_call(&json),
     })
 }
 
@@ -1429,14 +1484,25 @@ fn operation_from_pallet_call(pallet: &str, call: &str) -> Option<Operation> {
 }
 
 fn reward_from_decoded_call(value: &Value) -> Option<u128> {
+    field_u128_from_decoded_call(value, "reward")
+}
+
+fn slots_from_decoded_call(value: &Value) -> Option<u128> {
+    field_u128_from_decoded_call(value, "slots")
+}
+
+fn field_u128_from_decoded_call(value: &Value, key: &str) -> Option<u128> {
     match value {
         Value::Object(map) => {
-            if let Some(reward) = map.get("reward").and_then(json_u128) {
-                return Some(reward);
+            if let Some(value) = map.get(key).and_then(json_u128) {
+                return Some(value);
             }
-            map.values().find_map(reward_from_decoded_call)
+            map.values()
+                .find_map(|value| field_u128_from_decoded_call(value, key))
         }
-        Value::Array(items) => items.iter().find_map(reward_from_decoded_call),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|value| field_u128_from_decoded_call(value, key)),
         _ => None,
     }
 }
@@ -1645,6 +1711,11 @@ fn positional(value: Value) -> Value {
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
+    use liskov_self_custody_proto::{
+        LiskovSecretsUploadTarget, SecretCustodyMode, SecretSourceDeclaration, SecretSourceKind,
+        SecretSourceRef, SecretSyncContext, SecretTarget, SecretTargetKind, Sha256Digest,
+        SignerSecretManifest,
+    };
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -1652,6 +1723,50 @@ mod tests {
 
     fn seed_hex(byte: u8) -> String {
         format!("0x{}", hex::encode([byte; 32]))
+    }
+
+    fn sha256_digest(value: &str) -> Sha256Digest {
+        Sha256Digest::new(value).expect("valid sha256 digest")
+    }
+
+    fn secret_sync_request() -> SecretSyncRequest {
+        SecretSyncRequest {
+            request_id: "req-secret-sync".to_string(),
+            source_manifest_digest: sha256_digest(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            manifest: SignerSecretManifest {
+                context: SecretSyncContext {
+                    organization_id: "org-1".to_string(),
+                    application_id: "app-1".to_string(),
+                    policy_digest: None,
+                    policy_version_id: None,
+                    dispatch_id: None,
+                },
+                custody_mode: SecretCustodyMode::SignerSealed,
+                declarations: vec![SecretSourceDeclaration {
+                    secret_id: "telegram_bot_token".to_string(),
+                    target: SecretTarget {
+                        kind: SecretTargetKind::Env,
+                        name: Some("TELEGRAM_BOT_TOKEN".to_string()),
+                        path: None,
+                    },
+                    required: true,
+                    bundle_id: None,
+                    source: SecretSourceRef {
+                        kind: SecretSourceKind::LocalToml,
+                        r#ref: "local://telegram_bot_token".to_string(),
+                    },
+                    expected_provider_version: None,
+                    expected_commitment: None,
+                }],
+            },
+            liskov_secrets: LiskovSecretsUploadTarget {
+                base_url: "https://secrets.liskov.proof.computer".to_string(),
+                upload_path: Some("/api/signer/secret-versions".to_string()),
+            },
+            expires_at_ms: None,
+        }
     }
 
     fn test_runtime_expected_metadata() -> AcurastRuntimeMetadata {
@@ -1832,6 +1947,17 @@ mod tests {
     }
 
     #[test]
+    fn client_hello_advertises_deploy_and_secret_sync_capabilities() {
+        assert_eq!(
+            advertised_capabilities(),
+            vec![
+                SignerCapability::SignDeployLifecycle,
+                SignerCapability::PrepareLiskovSecretsFromSecretSources,
+            ]
+        );
+    }
+
+    #[test]
     fn keystore_round_trips_and_wrong_passphrase_fails() {
         let passphrase = SecretString("correct horse".to_string());
         let wrong = SecretString("wrong horse".to_string());
@@ -1953,13 +2079,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acu_balance_preflight_rejects_insufficient_register_balance() {
+    async fn acu_balance_preflight_rejects_below_total_escrow_plus_fee() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let runtime = test_runtime_with_free_balance(dir.path(), Some(1_009), 10);
+        let runtime = test_runtime_with_free_balance(dir.path(), Some(609), 10);
         let rejected = runtime
             .ensure_acu_balance_preflight(&VerifiedCall {
                 operation: Operation::AcurastRegister,
-                reward_planck: Some(1_000),
+                reward_planck: Some(300),
+                slots: Some(2),
+                reward_escrow_planck: Some(600),
                 call_bytes: vec![1, 2, 3],
             })
             .await
@@ -1978,18 +2106,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acu_balance_preflight_accepts_reward_plus_fee_buffer() {
+    async fn acu_balance_preflight_accepts_exact_total_escrow_plus_fee() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let runtime = test_runtime_with_free_balance(dir.path(), Some(1_010), 10);
+        let runtime = test_runtime_with_free_balance(dir.path(), Some(610), 10);
 
         runtime
             .ensure_acu_balance_preflight(&VerifiedCall {
                 operation: Operation::AcurastMarketplaceDeploy,
-                reward_planck: Some(1_000),
+                reward_planck: Some(300),
+                slots: Some(2),
+                reward_escrow_planck: Some(600),
                 call_bytes: vec![1, 2, 3],
             })
             .await
-            .expect("reward plus fee buffer accepted");
+            .expect("total escrow plus fee buffer accepted");
     }
 
     #[tokio::test]
@@ -2000,6 +2130,8 @@ mod tests {
             .ensure_acu_balance_preflight(&VerifiedCall {
                 operation: Operation::AcurastSetEnvironments,
                 reward_planck: None,
+                slots: None,
+                reward_escrow_planck: None,
                 call_bytes: vec![1, 2, 3],
             })
             .await
@@ -2011,22 +2143,111 @@ mod tests {
             .ensure_acu_balance_preflight(&VerifiedCall {
                 operation: Operation::AcurastDeregister,
                 reward_planck: None,
+                slots: None,
+                reward_escrow_planck: None,
                 call_bytes: vec![1, 2, 3],
             })
             .await
             .expect("fee buffer accepted for non-reward operation");
     }
 
+    #[tokio::test]
+    async fn acu_balance_preflight_rejects_reward_call_without_escrow_terms() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime_with_free_balance(dir.path(), Some(10_000), 10);
+        let rejected = runtime
+            .ensure_acu_balance_preflight(&VerifiedCall {
+                operation: Operation::AcurastRegister,
+                reward_planck: Some(300),
+                slots: None,
+                reward_escrow_planck: None,
+                call_bytes: vec![1, 2, 3],
+            })
+            .await
+            .expect_err("missing escrow rejected");
+        assert_eq!(rejected.reason, SignRejectionReason::InvalidCallBytes);
+    }
+
+    #[tokio::test]
+    async fn secret_sync_request_fails_closed_until_secret_engines_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime_with_free_balance(dir.path(), Some(10_000), 10);
+
+        let response = runtime.handle_secret_sync_request(secret_sync_request());
+
+        assert_eq!(
+            response,
+            Envelope::SecretSyncRejected(SecretSyncRejected {
+                request_id: "req-secret-sync".to_string(),
+                reason: SecretSyncRejectionReason::SecretSyncUnavailable,
+                message: Some(SECRET_SYNC_UNAVAILABLE_MESSAGE.to_string()),
+            })
+        );
+    }
+
     #[test]
-    fn reward_search_finds_nested_reward() {
+    fn reward_and_slots_search_finds_nested_terms() {
         let value = json!([{
             "extra": {
                 "requirements": {
-                    "reward": "123"
+                    "reward": "123",
+                    "slots": "4"
                 }
             }
         }]);
         assert_eq!(reward_from_decoded_call(&value), Some(123));
+        assert_eq!(slots_from_decoded_call(&value), Some(4));
+    }
+
+    #[test]
+    fn reward_terms_keep_request_cap_per_slot_and_total_escrow_for_spend() {
+        let terms =
+            verify_reward_terms(Operation::AcurastRegister, Some(300), Some(2), Some("300"))
+                .expect("per-slot reward at cap accepted");
+        assert_eq!(terms, (Some(300), Some(2), Some(600)));
+
+        let missing_slots = verify_reward_terms(
+            Operation::AcurastMarketplaceDeploy,
+            Some(300),
+            None,
+            Some("300"),
+        )
+        .expect_err("missing slots rejected");
+        assert_eq!(missing_slots.reason, SignRejectionReason::InvalidCallBytes);
+
+        let over_cap =
+            verify_reward_terms(Operation::AcurastRegister, Some(301), Some(2), Some("300"))
+                .expect_err("per-slot reward over cap rejected");
+        assert_eq!(over_cap.reason, SignRejectionReason::RewardCapExceeded);
+
+        let max_reward = u128::MAX.to_string();
+        let overflow = verify_reward_terms(
+            Operation::AcurastRegister,
+            Some(u128::MAX),
+            Some(2),
+            Some(max_reward.as_str()),
+        )
+        .expect_err("escrow overflow rejected");
+        assert_eq!(overflow.reason, SignRejectionReason::InvalidCallBytes);
+    }
+
+    #[test]
+    fn spend_ledger_reserves_and_confirms_total_escrow_amount() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = SpendLedger::new(
+            dir.path().join("spend.json"),
+            SpendLimits {
+                max_reward_per_request_planck: 1_000,
+                spend_window_planck: 1_000,
+                spend_window_seconds: 60,
+            },
+        );
+        ledger.reserve("r1", 600, 100).expect("reserve escrow");
+        ledger.confirm("r1", 101).expect("confirm escrow");
+        let stored = ledger.load().expect("load ledger");
+        assert_eq!(stored.reservations.len(), 1);
+        assert_eq!(stored.reservations[0].amount_planck, "600");
+        assert_eq!(stored.reservations[0].confirmed_at_epoch_seconds, Some(101));
     }
 
     #[test]

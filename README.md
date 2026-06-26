@@ -80,14 +80,16 @@ accepts only:
 - `acurast.deregister`
 
 `Balances::transfer` and all other value-movement calls are deliberately
-excluded. `register` and `deploy` must also fit the request cap, the local
-per-request cap, and the local rolling spend window.
+excluded. `register` and `deploy` must also fit the per-slot request cap; their
+total reward escrow (`reward * slots`) must fit the local per-request cap and
+the local rolling spend window.
 
 Before submitting, the daemon checks the signer's Acurast free balance. For
-`register` and marketplace `deploy`, free balance must cover the decoded reward
-plus `txFeeBufferPlanck`. For `setEnvironments` and `deregister`, free balance
-must cover the same fee buffer. Insufficient balance is rejected locally as
-`insufficient_acu_balance`; no extrinsic is submitted.
+`register` and marketplace `deploy`, free balance must cover decoded total
+reward escrow (`reward * slots`) plus `txFeeBufferPlanck`. For
+`setEnvironments` and `deregister`, free balance must cover the same fee
+buffer. Insufficient balance is rejected locally as `insufficient_acu_balance`;
+no extrinsic is submitted.
 
 ## Validation
 
