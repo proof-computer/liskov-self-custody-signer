@@ -602,6 +602,21 @@ mod tests {
     }
 
     #[test]
+    fn accepts_missing_metadata_hash_for_decode_compatibility() {
+        let mut value = sign_request_value("acurast.register", "0x04010203", json!("1000"));
+        value["payload"]["acurast"]
+            .as_object_mut()
+            .expect("acurast object")
+            .remove("metadataHash");
+
+        let decoded = serde_json::from_value::<Envelope>(value).expect("metadataHash is optional");
+        let Envelope::SignRequest(request) = decoded else {
+            panic!("expected sign request");
+        };
+        assert!(request.acurast.metadata_hash.is_none());
+    }
+
+    #[test]
     fn rejects_json_number_planck_amount() {
         let value = sign_request_value("acurast.register", "0x04010203", json!(1000));
 

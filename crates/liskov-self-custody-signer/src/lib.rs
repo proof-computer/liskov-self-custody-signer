@@ -1293,23 +1293,66 @@ fn compare_runtime_metadata(
     expected: &AcurastRuntimeMetadata,
     actual: &RuntimeSnapshot,
 ) -> Result<(), Rejection> {
-    if expected.genesis_hash.as_str() != actual.genesis_hash_hex
-        || expected.spec_name != actual.spec_name
-        || expected.spec_version != actual.spec_version
-        || expected.transaction_version != actual.transaction_version
-    {
+    compare_runtime_metadata_fields(
+        expected,
+        RuntimeMetadataFields {
+            genesis_hash_hex: &actual.genesis_hash_hex,
+            spec_name: &actual.spec_name,
+            spec_version: actual.spec_version,
+            transaction_version: actual.transaction_version,
+            metadata_hash_hex: &actual.metadata_hash_hex,
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RuntimeMetadataFields<'a> {
+    genesis_hash_hex: &'a str,
+    spec_name: &'a str,
+    spec_version: u32,
+    transaction_version: u32,
+    metadata_hash_hex: &'a str,
+}
+
+fn compare_runtime_metadata_fields(
+    expected: &AcurastRuntimeMetadata,
+    actual: RuntimeMetadataFields<'_>,
+) -> Result<(), Rejection> {
+    if expected.genesis_hash.as_str() != actual.genesis_hash_hex {
         return Err(Rejection::new(
             SignRejectionReason::MetadataMismatch,
-            "Acurast runtime version mismatch",
+            "Acurast genesis hash mismatch",
         ));
     }
-    if let Some(hash) = &expected.metadata_hash {
-        if hash.as_str() != actual.metadata_hash_hex {
-            return Err(Rejection::new(
-                SignRejectionReason::MetadataMismatch,
-                "Acurast metadata hash mismatch",
-            ));
-        }
+    if expected.spec_name != actual.spec_name {
+        return Err(Rejection::new(
+            SignRejectionReason::MetadataMismatch,
+            "Acurast spec name mismatch",
+        ));
+    }
+    if expected.spec_version != actual.spec_version {
+        return Err(Rejection::new(
+            SignRejectionReason::MetadataMismatch,
+            "Acurast spec version mismatch",
+        ));
+    }
+    if expected.transaction_version != actual.transaction_version {
+        return Err(Rejection::new(
+            SignRejectionReason::MetadataMismatch,
+            "Acurast transaction version mismatch",
+        ));
+    }
+    let Some(hash) = &expected.metadata_hash else {
+        return Err(Rejection::new(
+            SignRejectionReason::MetadataMismatch,
+            "Acurast metadata hash is required",
+        ));
+    };
+    if hash.as_str() != actual.metadata_hash_hex {
+        return Err(Rejection::new(
+            SignRejectionReason::MetadataMismatch,
+            "Acurast metadata hash mismatch",
+        ));
     }
     Ok(())
 }
@@ -1611,6 +1654,45 @@ mod tests {
         format!("0x{}", hex::encode([byte; 32]))
     }
 
+    fn test_runtime_expected_metadata() -> AcurastRuntimeMetadata {
+        AcurastRuntimeMetadata {
+            genesis_hash: HexString::new(
+                "0x1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .expect("genesis hash"),
+            spec_name: "acurast".to_string(),
+            spec_version: 1_000,
+            transaction_version: 25,
+            metadata_hash: Some(
+                HexString::new(
+                    "0x2222222222222222222222222222222222222222222222222222222222222222",
+                )
+                .expect("metadata hash"),
+            ),
+            rpc_url: Some("wss://acurast.rpc.proof.computer".to_string()),
+        }
+    }
+
+    fn test_runtime_actual_metadata() -> RuntimeMetadataFields<'static> {
+        RuntimeMetadataFields {
+            genesis_hash_hex: "0x1111111111111111111111111111111111111111111111111111111111111111",
+            spec_name: "acurast",
+            spec_version: 1_000,
+            transaction_version: 25,
+            metadata_hash_hex: "0x2222222222222222222222222222222222222222222222222222222222222222",
+        }
+    }
+
+    fn metadata_rejection_message(
+        expected: &AcurastRuntimeMetadata,
+        actual: RuntimeMetadataFields<'_>,
+    ) -> String {
+        let rejection = compare_runtime_metadata_fields(expected, actual)
+            .expect_err("metadata mismatch rejected");
+        assert_eq!(rejection.reason, SignRejectionReason::MetadataMismatch);
+        rejection.message.expect("message")
+    }
+
     struct FakeAcurastClient {
         free_balance: Option<u128>,
         submit_count: Arc<AtomicUsize>,
@@ -1790,6 +1872,84 @@ mod tests {
         ledger.confirm("r1", 102).expect("confirm r1");
         assert!(ledger.reserve("r3", 7, 111).is_ok());
         assert!(ledger.reserve("r4", 11, 112).is_err());
+    }
+
+    #[test]
+    fn runtime_metadata_comparison_requires_metadata_hash() {
+        let mut expected = test_runtime_expected_metadata();
+        expected.metadata_hash = None;
+
+        assert_eq!(
+            metadata_rejection_message(&expected, test_runtime_actual_metadata()),
+            "Acurast metadata hash is required"
+        );
+    }
+
+    #[test]
+    fn runtime_metadata_comparison_is_field_specific() {
+        let expected = test_runtime_expected_metadata();
+
+        assert_eq!(
+            metadata_rejection_message(
+                &expected,
+                RuntimeMetadataFields {
+                    genesis_hash_hex:
+                        "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    ..test_runtime_actual_metadata()
+                },
+            ),
+            "Acurast genesis hash mismatch"
+        );
+        assert_eq!(
+            metadata_rejection_message(
+                &expected,
+                RuntimeMetadataFields {
+                    spec_name: "acurast-next",
+                    ..test_runtime_actual_metadata()
+                },
+            ),
+            "Acurast spec name mismatch"
+        );
+        assert_eq!(
+            metadata_rejection_message(
+                &expected,
+                RuntimeMetadataFields {
+                    spec_version: 1_001,
+                    ..test_runtime_actual_metadata()
+                },
+            ),
+            "Acurast spec version mismatch"
+        );
+        assert_eq!(
+            metadata_rejection_message(
+                &expected,
+                RuntimeMetadataFields {
+                    transaction_version: 26,
+                    ..test_runtime_actual_metadata()
+                },
+            ),
+            "Acurast transaction version mismatch"
+        );
+        assert_eq!(
+            metadata_rejection_message(
+                &expected,
+                RuntimeMetadataFields {
+                    metadata_hash_hex:
+                        "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    ..test_runtime_actual_metadata()
+                },
+            ),
+            "Acurast metadata hash mismatch"
+        );
+    }
+
+    #[test]
+    fn runtime_metadata_comparison_accepts_exact_match() {
+        compare_runtime_metadata_fields(
+            &test_runtime_expected_metadata(),
+            test_runtime_actual_metadata(),
+        )
+        .expect("exact runtime metadata accepted");
     }
 
     #[tokio::test]
