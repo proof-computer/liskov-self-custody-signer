@@ -91,6 +91,13 @@ reward escrow (`reward * slots`) plus `txFeeBufferPlanck`. For
 buffer. Insufficient balance is rejected locally as `insufficient_acu_balance`;
 no extrinsic is submitted.
 
+The shared protocol crate also freezes the
+`proof.liskov.signer-secret-release.v1` request, ciphertext-only result, and
+stable refusal shapes. The current daemon does not advertise that capability:
+until a release engine can independently verify every binding and replay
+subject, it returns `signer_unavailable` and never falls back to managed
+custody. The canonical signing vector is checked in under `fixtures/`.
+
 ## Validation
 
 Run from the repository root:

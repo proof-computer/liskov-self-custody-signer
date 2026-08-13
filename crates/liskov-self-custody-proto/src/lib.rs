@@ -8,6 +8,7 @@ use thiserror::Error;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const CHALLENGE_SIGNING_DOMAIN: &str = "proof.liskov.self-custody-signer.challenge.v1";
 pub const SOURCE_MANIFEST_DIGEST_DOMAIN: &str = "proof.liskov.signer-secret-source-manifest.v1";
+pub const SIGNER_SECRET_RELEASE_DOMAIN: &str = "proof.liskov.signer-secret-release.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
@@ -32,6 +33,12 @@ pub enum Envelope {
     SecretSyncResult(SecretSyncResult),
     #[serde(rename = "secret.sync.rejected")]
     SecretSyncRejected(SecretSyncRejected),
+    #[serde(rename = "secret.release.request")]
+    SignerSecretReleaseRequest(SignerSecretReleaseRequest),
+    #[serde(rename = "secret.release.result")]
+    SignerSecretReleaseResult(SignerSecretReleaseResult),
+    #[serde(rename = "secret.release.rejected")]
+    SignerSecretReleaseRejected(SignerSecretReleaseRejected),
     #[serde(rename = "heartbeat")]
     Heartbeat(Heartbeat),
     #[serde(rename = "error")]
@@ -352,6 +359,116 @@ pub fn source_manifest_digest(
         manifest,
     ]);
     Ok(Sha256Digest::from_bytes(canonical_json(&value).as_bytes()))
+}
+
+/// A signer-mediated release request. Every field is part of the canonical
+/// signing payload so a connected customer signer can independently authorize
+/// one exact release without trusting mutable control-plane context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SignerSecretReleaseRequest {
+    pub request_id: String,
+    pub organization_id: String,
+    pub application_id: String,
+    pub policy_version_id: String,
+    pub policy_digest: Sha256Digest,
+    pub occurrence_id: String,
+    pub deployment_id: String,
+    pub job_id: String,
+    pub generation: u64,
+    pub processor_id: String,
+    pub grant: SignerSecretReleaseGrant,
+    pub secret_versions: Vec<SignerSecretReleaseVersion>,
+    pub job_public_key_p256: HexString,
+    pub challenge: HexString,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub replay_subject: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SignerSecretReleaseGrant {
+    pub grant_id: String,
+    pub grant_digest: Sha256Digest,
+    pub custody_revision: u64,
+    pub authorized_secret_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SignerSecretReleaseVersion {
+    pub secret_id: String,
+    pub secret_version_id: String,
+    pub commitment: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SignerSecretReleaseResult {
+    pub request_id: String,
+    pub challenge: HexString,
+    pub replay_subject: String,
+    pub ciphertexts: Vec<SignerSecretReleaseCiphertext>,
+    pub signer_signature: HexString,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SignerSecretReleaseCiphertext {
+    pub secret_id: String,
+    pub secret_version_id: String,
+    pub algorithm: SignerSecretReleaseAlgorithm,
+    pub ephemeral_public_key_p256: HexString,
+    pub nonce: HexString,
+    pub ciphertext: HexString,
+    pub associated_data_digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignerSecretReleaseAlgorithm {
+    #[serde(rename = "p256_hkdf_sha256_aes_256_gcm")]
+    P256HkdfSha256Aes256Gcm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SignerSecretReleaseRejected {
+    pub request_id: String,
+    pub reason: SignerSecretReleaseRejectionReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignerSecretReleaseRejectionReason {
+    #[serde(rename = "signer_unavailable")]
+    SignerUnavailable,
+    #[serde(rename = "request_expired")]
+    RequestExpired,
+    #[serde(rename = "replay_detected")]
+    ReplayDetected,
+    #[serde(rename = "binding_mismatch")]
+    BindingMismatch,
+}
+
+pub fn signer_secret_release_signing_payload(
+    request: &SignerSecretReleaseRequest,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let request = serde_json::to_value(request)?;
+    Ok(canonical_json(&Value::Array(vec![
+        Value::String(SIGNER_SECRET_RELEASE_DOMAIN.to_string()),
+        request,
+    ]))
+    .into_bytes())
+}
+
+pub fn signer_secret_release_request_digest(
+    request: &SignerSecretReleaseRequest,
+) -> Result<Sha256Digest, serde_json::Error> {
+    Ok(Sha256Digest::from_bytes(
+        &signer_secret_release_signing_payload(request)?,
+    ))
 }
 
 pub fn canonical_json(value: &Value) -> String {
@@ -819,6 +936,33 @@ mod tests {
                 reason: SecretSyncRejectionReason::SecretSyncUnavailable,
                 message: Some("secret sync is not available".to_owned()),
             }),
+            Envelope::SignerSecretReleaseRequest(signer_secret_release_request()),
+            Envelope::SignerSecretReleaseResult(SignerSecretReleaseResult {
+                request_id: "req-release".to_owned(),
+                challenge: hex("0x01020304"),
+                replay_subject: "release:occurrence-1:job-7:generation-3".to_owned(),
+                ciphertexts: vec![SignerSecretReleaseCiphertext {
+                    secret_id: "database_url".to_owned(),
+                    secret_version_id: "secver_42".to_owned(),
+                    algorithm: SignerSecretReleaseAlgorithm::P256HkdfSha256Aes256Gcm,
+                    ephemeral_public_key_p256: hex(
+                        "0x04aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    ),
+                    nonce: hex("0x111111111111111111111111"),
+                    ciphertext: hex("0x22222222222222223333333333333333"),
+                    associated_data_digest: sha(
+                        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    ),
+                }],
+                signer_signature: hex(
+                    "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                ),
+            }),
+            Envelope::SignerSecretReleaseRejected(SignerSecretReleaseRejected {
+                request_id: "req-release".to_owned(),
+                reason: SignerSecretReleaseRejectionReason::SignerUnavailable,
+                message: Some("signer-mediated secret release is unavailable".to_owned()),
+            }),
             Envelope::Heartbeat(Heartbeat {
                 now_ms: 1_750_000_010_000,
             }),
@@ -991,6 +1135,45 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn signer_secret_release_golden_vector_is_stable() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/signer-secret-release-v1.json"
+        ))
+        .expect("golden fixture parses");
+        assert_eq!(fixture["domain"], SIGNER_SECRET_RELEASE_DOMAIN);
+
+        let request: SignerSecretReleaseRequest =
+            serde_json::from_value(fixture["request"].clone()).expect("request decodes");
+        assert_eq!(request, signer_secret_release_request());
+
+        let payload = String::from_utf8(
+            signer_secret_release_signing_payload(&request).expect("payload serializes"),
+        )
+        .expect("payload is utf8");
+        assert_eq!(fixture["canonicalSigningPayload"], payload);
+        assert_eq!(
+            fixture["requestDigest"],
+            serde_json::to_value(
+                signer_secret_release_request_digest(&request).expect("digest computes")
+            )
+            .expect("digest serializes")
+        );
+
+        for reason in [
+            SignerSecretReleaseRejectionReason::SignerUnavailable,
+            SignerSecretReleaseRejectionReason::RequestExpired,
+            SignerSecretReleaseRejectionReason::ReplayDetected,
+            SignerSecretReleaseRejectionReason::BindingMismatch,
+        ] {
+            let encoded = serde_json::to_value(reason).expect("reason serializes");
+            assert!(fixture["stableRejections"]
+                .as_array()
+                .expect("rejection list")
+                .contains(&encoded));
+        }
     }
 
     #[test]
@@ -1223,6 +1406,45 @@ address:5FSignerAddress"
                 upload_path: Some("/api/signer/secret-versions".to_owned()),
             },
             expires_at_ms: Some(1_750_000_060_000),
+        }
+    }
+
+    fn signer_secret_release_request() -> SignerSecretReleaseRequest {
+        SignerSecretReleaseRequest {
+            request_id: "req-release".to_owned(),
+            organization_id: "org_123".to_owned(),
+            application_id: "app_456".to_owned(),
+            policy_version_id: "policy-version-5".to_owned(),
+            policy_digest: sha(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            occurrence_id: "occurrence-1".to_owned(),
+            deployment_id: "deployment-9".to_owned(),
+            job_id: "job-7".to_owned(),
+            generation: 3,
+            processor_id: "processor-acurast-1".to_owned(),
+            grant: SignerSecretReleaseGrant {
+                grant_id: "grant-2".to_owned(),
+                grant_digest: sha(
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ),
+                custody_revision: 4,
+                authorized_secret_ids: vec!["database_url".to_owned()],
+            },
+            secret_versions: vec![SignerSecretReleaseVersion {
+                secret_id: "database_url".to_owned(),
+                secret_version_id: "secver_42".to_owned(),
+                commitment: sha(
+                    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                ),
+            }],
+            job_public_key_p256: hex(
+                "0x04dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            ),
+            challenge: hex("0x01020304"),
+            issued_at_ms: 1_775_000_000_000,
+            expires_at_ms: 1_775_000_030_000,
+            replay_subject: "release:occurrence-1:job-7:generation-3".to_owned(),
         }
     }
 

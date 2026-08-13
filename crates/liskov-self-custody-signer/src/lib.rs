@@ -19,7 +19,8 @@ use liskov_self_custody_proto::{
     challenge_signing_payload, AcurastRuntimeMetadata, ChainEvent, ChallengeResponse, ClientHello,
     Envelope, HexString, Operation, SecretSyncRejected, SecretSyncRejectionReason,
     SecretSyncRequest, ServerReady, SignRejected, SignRejectionReason, SignRequest, SignResult,
-    SignerCapability, PROTOCOL_VERSION,
+    SignerCapability, SignerSecretReleaseRejected, SignerSecretReleaseRejectionReason,
+    SignerSecretReleaseRequest, PROTOCOL_VERSION,
 };
 use schnorrkel::{ExpansionMode, MiniSecretKey};
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,8 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const INSUFFICIENT_ACU_BALANCE_MESSAGE: &str =
     "Fund the self-custody address with enough ACU to cover total deployment reward escrow and the transaction fee buffer, then retry.";
 const SECRET_SYNC_UNAVAILABLE_MESSAGE: &str = "Secret sync is not available in this signer build.";
+const SECRET_RELEASE_UNAVAILABLE_MESSAGE: &str =
+    "Signer-mediated secret release is not available in this signer build.";
 
 #[derive(Clone, Parser, PartialEq, Eq)]
 #[command(
@@ -339,6 +342,10 @@ where
                         let response = self.handle_secret_sync_request(request);
                         send_envelope(&mut socket, &response).await?;
                     }
+                    Ok(Envelope::SignerSecretReleaseRequest(request)) => {
+                        let response = self.handle_secret_release_request(request);
+                        send_envelope(&mut socket, &response).await?;
+                    }
                     Ok(Envelope::Heartbeat(heartbeat)) => {
                         send_envelope(&mut socket, &Envelope::Heartbeat(heartbeat)).await?;
                     }
@@ -429,6 +436,14 @@ where
             request_id: request.request_id,
             reason: SecretSyncRejectionReason::SecretSyncUnavailable,
             message: Some(SECRET_SYNC_UNAVAILABLE_MESSAGE.to_string()),
+        })
+    }
+
+    fn handle_secret_release_request(&self, request: SignerSecretReleaseRequest) -> Envelope {
+        Envelope::SignerSecretReleaseRejected(SignerSecretReleaseRejected {
+            request_id: request.request_id,
+            reason: SignerSecretReleaseRejectionReason::SignerUnavailable,
+            message: Some(SECRET_RELEASE_UNAVAILABLE_MESSAGE.to_string()),
         })
     }
 
@@ -2182,6 +2197,35 @@ mod tests {
                 reason: SecretSyncRejectionReason::SecretSyncUnavailable,
                 message: Some(SECRET_SYNC_UNAVAILABLE_MESSAGE.to_string()),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_release_request_fails_closed_without_managed_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime_with_free_balance(dir.path(), Some(10_000), 10);
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/signer-secret-release-v1.json"
+        ))
+        .expect("golden fixture parses");
+        let request: SignerSecretReleaseRequest =
+            serde_json::from_value(fixture["request"].clone()).expect("request decodes");
+
+        let response = runtime.handle_secret_release_request(request);
+
+        assert_eq!(
+            response,
+            Envelope::SignerSecretReleaseRejected(SignerSecretReleaseRejected {
+                request_id: "req-release".to_string(),
+                reason: SignerSecretReleaseRejectionReason::SignerUnavailable,
+                message: Some(SECRET_RELEASE_UNAVAILABLE_MESSAGE.to_string()),
+            })
+        );
+        assert!(
+            !advertised_capabilities()
+                .iter()
+                .any(|capability| format!("{capability:?}").contains("Release")),
+            "an unimplemented release engine must not be advertised"
         );
     }
 
