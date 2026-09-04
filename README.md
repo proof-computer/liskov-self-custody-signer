@@ -8,6 +8,29 @@ tenant's sr25519 Acurast seed in an encrypted local keystore, dials out to
 calls, submits accepted transactions directly to Acurast RPC, and returns the
 finalized transaction result.
 
+## Install
+
+Download the `v0.1.0` release for your platform from
+<https://github.com/proof-computer/liskov-self-custody-signer/releases/tag/v0.1.0>.
+Each release includes four archives plus `SHA256SUMS`:
+
+- `liskov-self-custody-signer-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`
+- `liskov-self-custody-signer-v0.1.0-x86_64-apple-darwin.tar.gz`
+- `liskov-self-custody-signer-v0.1.0-aarch64-apple-darwin.tar.gz`
+- `liskov-self-custody-signer-v0.1.0-x86_64-pc-windows-msvc.zip`
+
+Verify the archive against the published checksums before running it:
+
+```sh
+curl -fsSL -O https://github.com/proof-computer/liskov-self-custody-signer/releases/download/v0.1.0/SHA256SUMS
+curl -fsSL -O https://github.com/proof-computer/liskov-self-custody-signer/releases/download/v0.1.0/liskov-self-custody-signer-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf liskov-self-custody-signer-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+./liskov-self-custody-signer-v0.1.0-x86_64-unknown-linux-gnu/liskov-self-custody-signer --version
+```
+
+`--version` prints `0.1.0` plus the git sha baked into that build.
+
 ## Init
 
 Seed import is stdin-only:

@@ -43,6 +43,8 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Build release binary
+        env:
+          LISKOV_SELF_CUSTODY_SIGNER_GIT_SHA: ${{ github.sha }}
         run: cargo build --release --locked --bin liskov-self-custody-signer --target ${{ matrix.target }}
 
       - name: Package archive

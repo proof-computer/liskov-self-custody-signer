@@ -17,7 +17,7 @@ use clap::{Args, Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use liskov_self_custody_proto::{
     challenge_signing_payload, AcurastRuntimeMetadata, ChainEvent, ChallengeResponse, ClientHello,
-    Envelope, HexString, Operation, SecretSyncRejected, SecretSyncRejectionReason,
+    Envelope, ErrorCode, HexString, Operation, SecretSyncRejected, SecretSyncRejectionReason,
     SecretSyncRequest, ServerReady, SignRejected, SignRejectionReason, SignRequest, SignResult,
     SignerCapability, SignerSecretReleaseRejected, SignerSecretReleaseRejectionReason,
     SignerSecretReleaseRequest, PROTOCOL_VERSION,
@@ -112,10 +112,22 @@ impl Cli {
     pub fn status_message(&self) -> String {
         format!(
             "liskov-self-custody-signer {} (protocol v{})\nconfig: {self}",
-            env!("CARGO_PKG_VERSION"),
+            build_version(),
             PROTOCOL_VERSION
         )
     }
+}
+
+pub fn build_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| match option_env!("LISKOV_SELF_CUSTODY_SIGNER_GIT_SHA") {
+            Some(sha) if !sha.is_empty() => {
+                format!("{} ({sha})", env!("CARGO_PKG_VERSION"))
+            }
+            _ => env!("CARGO_PKG_VERSION").to_string(),
+        })
+        .as_str()
 }
 
 impl fmt::Debug for Cli {
@@ -279,15 +291,29 @@ where
 {
     async fn run_forever(self) -> Result<(), SignerError> {
         loop {
-            if let Err(error) = self.run_socket_once().await {
-                eprintln!(
-                    "{}",
-                    json!({
-                        "level": "warn",
-                        "component": "liskov-self-custody-signer",
-                        "message": sanitize_error(&error.to_string()),
-                    })
-                );
+            match self.run_socket_once().await {
+                Err(error) if error.is_fatal_handshake() => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "level": "error",
+                            "component": "liskov-self-custody-signer",
+                            "message": sanitize_error(&error.to_string()),
+                        })
+                    );
+                    return Err(error);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "level": "warn",
+                            "component": "liskov-self-custody-signer",
+                            "message": sanitize_error(&error.to_string()),
+                        })
+                    );
+                }
+                Ok(()) => {}
             }
             tokio::time::sleep(RECONNECT_DELAY).await;
         }
@@ -295,9 +321,7 @@ where
 
     async fn run_socket_once(&self) -> Result<(), SignerError> {
         let url = self.connect_url()?;
-        let (mut socket, _) = connect_async(url).await.map_err(|error| {
-            SignerError::Websocket(format!("control-plane websocket connect failed: {error}"))
-        })?;
+        let (mut socket, _) = connect_async(url).await.map_err(map_connect_error)?;
         send_envelope(
             &mut socket,
             &Envelope::ClientHello(ClientHello {
@@ -350,6 +374,12 @@ where
                         send_envelope(&mut socket, &Envelope::Heartbeat(heartbeat)).await?;
                     }
                     Ok(Envelope::Error(error)) => {
+                        if let Some(code) = fatal_handshake_wire_code(error.code) {
+                            return Err(SignerError::FatalHandshake {
+                                code: code.to_string(),
+                                message: error.message,
+                            });
+                        }
                         return Err(SignerError::Websocket(format!(
                             "control plane returned protocol error {:?}: {}",
                             error.code, error.message
@@ -401,9 +431,10 @@ where
 
     fn persist_ready(&self, ready: &ServerReady) -> Result<(), SignerError> {
         if ready.protocol_version != PROTOCOL_VERSION {
-            return Err(SignerError::Websocket(
-                "server.ready protocolVersion mismatch".to_string(),
-            ));
+            return Err(SignerError::FatalHandshake {
+                code: "protocolVersionUnsupported".to_string(),
+                message: "server.ready protocolVersion mismatch".to_string(),
+            });
         }
         if ready.address.trim() != self.signer.address() {
             return Err(SignerError::Websocket(
@@ -1592,15 +1623,62 @@ pub enum SignerError {
     Rpc(String),
     #[error("{0}")]
     SigningUnavailable(String),
+    #[error("control plane rejected the handshake ({code}): {message}")]
+    FatalHandshake { code: String, message: String },
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
     #[error("randomness unavailable")]
     Random(#[from] getrandom::Error),
 }
 
+impl SignerError {
+    fn is_fatal_handshake(&self) -> bool {
+        matches!(self, Self::FatalHandshake { .. })
+    }
+}
+
 impl From<tokio_tungstenite::tungstenite::Error> for SignerError {
     fn from(error: tokio_tungstenite::tungstenite::Error) -> Self {
         Self::Websocket(format!("websocket write failed: {error}"))
+    }
+}
+
+fn map_connect_error(error: tokio_tungstenite::tungstenite::Error) -> SignerError {
+    if let tokio_tungstenite::tungstenite::Error::Http(response) = &error {
+        let status = response.status().as_u16();
+        if status == 401 || status == 403 {
+            let body = response.body().as_deref().unwrap_or(&[]);
+            let code = handshake_code_from_http_body(body)
+                .unwrap_or_else(|| "authenticationFailed".to_string());
+            return SignerError::FatalHandshake {
+                code,
+                message: format!("control-plane websocket connect rejected with HTTP {status}"),
+            };
+        }
+    }
+    SignerError::Websocket(format!("control-plane websocket connect failed: {error}"))
+}
+
+fn handshake_code_from_http_body(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let code = value.get("error")?.as_str()?.trim();
+    if code.is_empty() || code.len() > 64 {
+        return None;
+    }
+    if !code
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return None;
+    }
+    Some(code.to_string())
+}
+
+fn fatal_handshake_wire_code(code: ErrorCode) -> Option<&'static str> {
+    match code {
+        ErrorCode::AuthenticationFailed => Some("authenticationFailed"),
+        ErrorCode::ProtocolVersionUnsupported => Some("protocolVersionUnsupported"),
+        ErrorCode::BadRequest | ErrorCode::Internal => None,
     }
 }
 
@@ -1727,9 +1805,9 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use liskov_self_custody_proto::{
-        LiskovSecretsUploadTarget, SecretCustodyMode, SecretSourceDeclaration, SecretSourceKind,
-        SecretSourceRef, SecretSyncContext, SecretTarget, SecretTargetKind, Sha256Digest,
-        SignerSecretManifest,
+        ErrorMessage, LiskovSecretsUploadTarget, SecretCustodyMode, SecretSourceDeclaration,
+        SecretSourceKind, SecretSourceRef, SecretSyncContext, SecretTarget, SecretTargetKind,
+        Sha256Digest, SignerSecretManifest,
     };
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -1903,9 +1981,146 @@ mod tests {
         }
     }
 
+    fn test_runtime_dialing(
+        dir: &Path,
+        control_plane_url: &str,
+    ) -> DaemonRuntime<FakeAcurastClient> {
+        let mut runtime = test_runtime_with_free_balance(dir, Some(1_000), 1);
+        runtime.config.control_plane_url = control_plane_url.to_string();
+        runtime.config.pairing_token = Some("test-pairing-token".to_string());
+        runtime
+    }
+
     #[test]
     fn clap_command_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn build_version_starts_with_package_version() {
+        let version = build_version();
+        assert!(version.starts_with(env!("CARGO_PKG_VERSION")));
+        if let Some(sha) = option_env!("LISKOV_SELF_CUSTODY_SIGNER_GIT_SHA") {
+            if !sha.is_empty() {
+                assert!(version.contains(sha));
+            }
+        }
+    }
+
+    #[test]
+    fn clap_version_uses_build_identity() {
+        let version = build_version();
+        let command = Cli::command().version(version);
+        assert!(command.render_version().contains(version));
+    }
+
+    #[test]
+    fn persist_ready_protocol_mismatch_is_fatal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime_with_free_balance(dir.path(), Some(1), 1);
+        let error = runtime
+            .persist_ready(&ServerReady {
+                organization_id: "org-1".to_string(),
+                application_id: "app-1".to_string(),
+                address: runtime.signer.address().to_string(),
+                protocol_version: PROTOCOL_VERSION + 1,
+            })
+            .expect_err("protocol mismatch is fatal");
+        assert!(error.is_fatal_handshake());
+        let rendered = error.to_string();
+        assert!(rendered.contains("protocolVersionUnsupported"));
+        assert!(!rendered.contains("test-pairing-token"));
+    }
+
+    #[tokio::test]
+    async fn invalid_pairing_token_exits_without_retry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind handshake listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let body = r#"{"ok":false,"error":"invalid_pairing_token"}"#;
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime_dialing(dir.path(), &format!("ws://{addr}"));
+        let error = tokio::time::timeout(Duration::from_secs(2), runtime.run_forever())
+            .await
+            .expect("invalid pairing exits within one round trip")
+            .expect_err("invalid pairing is fatal");
+        let rendered = error.to_string();
+        assert!(error.is_fatal_handshake());
+        assert!(rendered.contains("invalid_pairing_token"));
+        assert!(!rendered.contains("test-pairing-token"));
+    }
+
+    #[tokio::test]
+    async fn protocol_version_error_envelope_exits_without_retry() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind envelope listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut socket) = accept_async(stream).await else {
+                return;
+            };
+            let _ = socket.next().await;
+            let envelope = Envelope::Error(ErrorMessage {
+                request_id: None,
+                code: ErrorCode::ProtocolVersionUnsupported,
+                message: "protocol version unsupported".to_string(),
+            });
+            let Ok(text) = serde_json::to_string(&envelope) else {
+                return;
+            };
+            let _ = socket.send(Message::Text(text)).await;
+            let _ = socket.close(None).await;
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime_dialing(dir.path(), &format!("ws://{addr}"));
+        let error = tokio::time::timeout(Duration::from_secs(2), runtime.run_forever())
+            .await
+            .expect("protocol mismatch exits within one round trip")
+            .expect_err("protocol mismatch is fatal");
+        let rendered = error.to_string();
+        assert!(error.is_fatal_handshake());
+        assert!(rendered.contains("protocolVersionUnsupported"));
+        assert!(!rendered.contains("test-pairing-token"));
+    }
+
+    #[tokio::test]
+    async fn unreachable_control_plane_keeps_reconnecting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime_dialing(dir.path(), "ws://127.0.0.1:1");
+        let handle = tokio::spawn(async move { runtime.run_forever().await });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !handle.is_finished(),
+            "transport errors must keep retrying instead of exiting"
+        );
+        handle.abort();
+        let _ = handle.await;
     }
 
     #[test]
