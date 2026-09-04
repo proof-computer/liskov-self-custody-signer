@@ -132,6 +132,8 @@ pub struct RequestContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_version_id: Option<String>,
     pub operation: Operation,
+    /// Policy-authored reward ceiling. Must not be derived from the reward
+    /// already embedded in `call_bytes_hex`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_reward_planck: Option<DecimalPlanck>,
 }

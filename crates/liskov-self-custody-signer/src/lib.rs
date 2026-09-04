@@ -2250,6 +2250,11 @@ mod tests {
                 .expect("per-slot reward at cap accepted");
         assert_eq!(terms, (Some(300), Some(2), Some(600)));
 
+        let below_independent_cap =
+            verify_reward_terms(Operation::AcurastRegister, Some(300), Some(2), Some("5000"))
+                .expect("decoded reward below an independent wire cap is accepted");
+        assert_eq!(below_independent_cap, (Some(300), Some(2), Some(600)));
+
         let missing_slots = verify_reward_terms(
             Operation::AcurastMarketplaceDeploy,
             Some(300),
