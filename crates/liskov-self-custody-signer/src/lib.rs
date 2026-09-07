@@ -2130,7 +2130,7 @@ mod tests {
             "--config",
             "signer.json",
             "--control-plane-url",
-            "wss://liskov.proof.computer/api/custody/signer",
+            "wss://api.liskov.proof.computer/api/custody/signer",
             "--pairing-token",
             "pairing-token-secret",
             "--keystore-passphrase",
@@ -2538,7 +2538,7 @@ mod tests {
         let cli = Cli::parse_from([
             "liskov-self-custody-signer",
             "--control-plane-url",
-            "wss://liskov.proof.computer/api/custody/signer",
+            "wss://api.liskov.proof.computer/api/custody/signer",
             "--keystore-path",
             "signer.json",
             "--keystore-passphrase",
@@ -2553,7 +2553,7 @@ mod tests {
         let missing = Cli::parse_from([
             "liskov-self-custody-signer",
             "--control-plane-url",
-            "wss://liskov.proof.computer/api/custody/signer",
+            "wss://api.liskov.proof.computer/api/custody/signer",
             "--keystore-path",
             "signer.json",
             "--keystore-passphrase",
@@ -2571,7 +2571,7 @@ mod tests {
         let zero = Cli::parse_from([
             "liskov-self-custody-signer",
             "--control-plane-url",
-            "wss://liskov.proof.computer/api/custody/signer",
+            "wss://api.liskov.proof.computer/api/custody/signer",
             "--keystore-path",
             "signer.json",
             "--keystore-passphrase",
@@ -2587,5 +2587,77 @@ mod tests {
         ]);
         let error = RunConfig::from_cli_env_and_file(&zero).expect_err("zero fee buffer");
         assert!(error.to_string().contains("greater than zero"));
+    }
+}
+
+/// The flat apex was withdrawn (BKLG-20260822-84f5): its DNS record was removed,
+/// so a caller gets a resolution failure with no HTTP status — which reads like
+/// a transient blip and is not. The released v0.1.0 README and these fixtures
+/// all used it as a URL, so a customer following the documentation verbatim
+/// could not connect (BKLG-20260907-fln0's readback).
+///
+/// This guard fails if it comes back **as a URL**. Prose explaining the
+/// withdrawal is fine and deliberately still allowed; what must never reappear
+/// is a scheme-prefixed host with no `api.` label.
+#[cfg(test)]
+mod retired_apex_guard {
+    /// Built from parts so this file does not itself contain the literal it
+    /// forbids.
+    const APEX_HOST: &str = concat!("liskov", ".proof", ".computer");
+
+    #[test]
+    fn no_url_names_the_withdrawn_apex() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crate sits two levels below the repo root");
+
+        // Only a scheme-prefixed occurrence is a usable address. `api.` and any
+        // other label in front of the apex is a different, live host.
+        let needles = ["://", "@"].map(|prefix| format!("{prefix}{APEX_HOST}"));
+
+        let mut offenders = Vec::new();
+        let mut check = |path: &std::path::Path| {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                return;
+            };
+            for (index, line) in text.lines().enumerate() {
+                if needles.iter().any(|needle| line.contains(needle.as_str())) {
+                    offenders.push(format!("{}:{}", path.display(), index + 1));
+                }
+            }
+        };
+
+        check(&repo_root.join("README.md"));
+        for crate_dir in ["liskov-self-custody-signer", "liskov-self-custody-proto"] {
+            let src = repo_root.join("crates").join(crate_dir).join("src");
+            let Ok(entries) = std::fs::read_dir(&src) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "rs") {
+                    check(&path);
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "the withdrawn apex is used as a URL at: {offenders:#?}\n\
+             prefix it with `api.` — the bare apex has no DNS record"
+        );
+    }
+
+    /// The guard must actually catch the shape it claims to. Without this, a
+    /// rule that silently matches nothing looks identical to a clean tree.
+    #[test]
+    fn the_guard_matches_a_scheme_prefixed_apex() {
+        let bad = format!("  --control-plane-url wss://{APEX_HOST}/api/custody/signer");
+        let good = format!("  --control-plane-url wss://api.{APEX_HOST}/api/custody/signer");
+        let needle = format!("://{APEX_HOST}");
+        assert!(bad.contains(&needle), "guard would miss the real defect");
+        assert!(!good.contains(&needle), "guard would reject the live host");
     }
 }

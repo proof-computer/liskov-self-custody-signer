@@ -44,6 +44,43 @@ passphrase must come from `--keystore-passphrase` or
 `LISKOV_SELF_CUSTODY_SIGNER_PASSPHRASE`. `init` prints only the derived SS58
 address.
 
+### If your key is a recovery phrase
+
+`init` takes a raw 32-byte seed, not a mnemonic — the daemon has no BIP39
+support at all. A recovery phrase must be converted first, and **not** with a
+stock BIP39 derivation: Substrate's sr25519 keys use the `substrate-bip39`
+mini-secret, so a plain BIP39 64-byte seed yields a valid-looking but different
+account. Funding that account would strand the funds where the daemon cannot
+sign for them.
+
+Either tool produces the right value:
+
+```sh
+# subkey prints it as "Secret seed"
+subkey inspect "<your twelve words>"
+```
+
+```js
+// @polkadot/util-crypto computes the same 32 bytes
+import { cryptoWaitReady, mnemonicToMiniSecret } from '@polkadot/util-crypto';
+await cryptoWaitReady();
+const miniSecret = mnemonicToMiniSecret('<your twelve words>');  // 32 bytes
+```
+
+Write that value, `0x`-prefixed, to a file with a restrictive umask, pass it on
+stdin, and remove it afterwards:
+
+```sh
+umask 077
+printf '0x%s' "<64 hex chars>" > seed.mini
+liskov-self-custody-signer init --keystore signer-keystore.json --seed-hex-stdin < seed.mini
+shred -u seed.mini
+```
+
+**Check the address before funding anything.** The SS58 address `init` prints
+must equal the one your derivation tool reported. If they differ, the keystore
+holds a different key than you think it does; stop rather than send ACU to it.
+
 The keystore JSON uses Argon2id plus AES-256-GCM. The plaintext seed is never
 logged or written outside the encrypted keystore.
 
@@ -53,7 +90,7 @@ The flat command printed by `proof liskov custody pair` is still supported:
 
 ```sh
 liskov-self-custody-signer \
-  --control-plane-url wss://liskov.proof.computer/api/custody/signer \
+  --control-plane-url wss://api.liskov.proof.computer/api/custody/signer \
   --pairing-token <token> \
   --keystore-path signer-keystore.json \
   --max-reward-per-request-planck 1000000000000 \
@@ -61,6 +98,13 @@ liskov-self-custody-signer \
   --spend-window-planck 5000000000000 \
   --spend-window-seconds 86400
 ```
+
+`--control-plane-url` is used **verbatim**: the daemon appends query parameters
+to it but never a scheme or a path. It must therefore be the complete websocket
+URL, `wss://` and `/api/custody/signer` included. An `https://` URL fails as
+`URL error: URL scheme not supported`, and a bare host fails the handshake. The
+host is `api.liskov.proof.computer` — the flat apex `liskov.proof.computer` was
+withdrawn and no longer resolves.
 
 After the first successful challenge-response, the daemon stores a
 `*.ready.json` binding beside the keystore and reconnects with the bound
