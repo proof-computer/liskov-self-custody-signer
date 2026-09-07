@@ -853,7 +853,7 @@ mod tests {
                 context: ChallengeContext {
                     organization_id: "org_123".to_owned(),
                     application_id: "app_456".to_owned(),
-                    origin: "https://liskov.proof.computer".to_owned(),
+                    origin: "https://api.liskov.proof.computer".to_owned(),
                 },
             }),
             Envelope::ChallengeResponse(ChallengeResponse {
@@ -1309,7 +1309,7 @@ mod tests {
             context: ChallengeContext {
                 organization_id: "org_123".to_owned(),
                 application_id: "app_456".to_owned(),
-                origin: "https://liskov.proof.computer".to_owned(),
+                origin: "https://api.liskov.proof.computer".to_owned(),
             },
         };
 
@@ -1325,7 +1325,7 @@ issuedAtMs:1750000000000\n\
 expiresAtMs:1750000030000\n\
 organizationId:org_123\n\
 applicationId:app_456\n\
-origin:https://liskov.proof.computer\n\
+origin:https://api.liskov.proof.computer\n\
 address:5FSignerAddress"
         );
     }
