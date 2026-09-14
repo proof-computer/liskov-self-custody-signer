@@ -15,7 +15,8 @@
     "authorityExpired",
     "authorityMismatch",
     "authorityMalformed",
-    "authorityReplayed"
+    "authorityReplayed",
+    "protocolUnsupported"
   ],
   "wire": {
     "helloV1": "{\"type\":\"client.hello\",\"payload\":{\"protocolVersion\":1,\"signerVersion\":\"0.2.0\",\"address\":\"5FSignerAddress\",\"capabilities\":[\"sign.deployLifecycle\",\"prepare.liskovSecretsFromSecretSources\"]}}",

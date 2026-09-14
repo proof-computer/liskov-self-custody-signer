@@ -698,6 +698,11 @@ pub enum SignRejectionReason {
     /// request or call.
     #[serde(rename = "authorityReplayed")]
     AuthorityReplayed,
+    /// Control plane only, never sent by a daemon: the request carries a
+    /// placement authority but the connected signer negotiated version 1, so it
+    /// was refused before delivery. Known no-spend — nothing left the process.
+    #[serde(rename = "protocolUnsupported")]
+    ProtocolUnsupported,
     #[serde(rename = "operationNotAllowed")]
     OperationNotAllowed,
     #[serde(rename = "metadataMismatch")]
@@ -1858,6 +1863,7 @@ address:5FSignerAddress"
                 SignRejectionReason::AuthorityMismatch,
                 SignRejectionReason::AuthorityMalformed,
                 SignRejectionReason::AuthorityReplayed,
+                SignRejectionReason::ProtocolUnsupported,
             ],
         })
     }
