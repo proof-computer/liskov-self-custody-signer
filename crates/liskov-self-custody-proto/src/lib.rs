@@ -5,7 +5,25 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+/// The original wire: deploy-lifecycle signing with no placement authority.
+/// A daemon or control plane that only speaks this version still interoperates
+/// through it, and is never sent an authority-bound request.
+pub const LEGACY_PROTOCOL_VERSION: u16 = 1;
+/// Adds an expiring placement authority to `sign.request` and a submission
+/// phase to `sign.rejected` (BKLG-20260820-9ldj, ADR-0088 §5). Negotiated: a
+/// peer speaks it only when both sides advertised it in the handshake.
+pub const PLACEMENT_AUTHORITY_PROTOCOL_VERSION: u16 = 2;
+/// The newest version this crate speaks.
+pub const PROTOCOL_VERSION: u16 = PLACEMENT_AUTHORITY_PROTOCOL_VERSION;
+/// Version of the `PlacementAuthority` object and its digest payload.
+pub const PLACEMENT_AUTHORITY_VERSION: u16 = 1;
+pub const PLACEMENT_AUTHORITY_DIGEST_DOMAIN: &str = "proof.liskov.signer-placement-authority.v1";
+/// The longest an authority may be valid for. Matches the control plane's
+/// occurrence-authority lease; a longer window is malformed, not generous.
+pub const PLACEMENT_AUTHORITY_MAX_WINDOW_MS: u64 = 600_000;
+/// How far in the future `issuedAtMs` may sit before the signer calls the
+/// authority malformed rather than blaming its own clock.
+pub const PLACEMENT_AUTHORITY_MAX_CLOCK_SKEW_MS: u64 = 30_000;
 pub const CHALLENGE_SIGNING_DOMAIN: &str = "proof.liskov.self-custody-signer.challenge.v1";
 pub const SOURCE_MANIFEST_DIGEST_DOMAIN: &str = "proof.liskov.signer-secret-source-manifest.v1";
 pub const SIGNER_SECRET_RELEASE_DOMAIN: &str = "proof.liskov.signer-secret-release.v1";
@@ -60,6 +78,22 @@ pub enum SignerCapability {
     SignDeployLifecycle,
     #[serde(rename = "prepare.liskovSecretsFromSecretSources")]
     PrepareLiskovSecretsFromSecretSources,
+}
+
+/// Whether a peer's hello names a version this crate can speak.
+///
+/// Placement-authority signing is negotiated by the version alone, never by a
+/// new capability value. A version-1 control plane parses the hello with this
+/// crate's strict readers *before* it checks the version: an unknown capability
+/// would fail that parse and come back as `badRequest`, which a daemon cannot
+/// tell from any other transient refusal. A version-2 hello that only differs
+/// in its number parses, and earns the `protocolVersionUnsupported` answer a
+/// daemon can act on by reconnecting at version 1.
+pub fn is_supported_protocol_version(version: u16) -> bool {
+    matches!(
+        version,
+        LEGACY_PROTOCOL_VERSION | PLACEMENT_AUTHORITY_PROTOCOL_VERSION
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +154,137 @@ pub struct SignRequest {
     pub call_bytes_hex: HexString,
     pub context: RequestContext,
     pub acurast: AcurastRuntimeMetadata,
+    /// Present only on a version-2 session. Absent, the bytes are exactly the
+    /// version-1 request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<PlacementAuthority>,
+}
+
+/// The exact placement attempt a signature is for, and how long it may be
+/// acted on (ADR-0088 §5).
+///
+/// The signer checks what it can know independently: the window against its own
+/// clock, `callDigest` against the call bytes it is about to sign, and
+/// `authorityDigest` over every other field plus the request context.
+/// `payloadDigest` is the control plane's digest of the durable effect payload;
+/// the signer cannot recompute it from the call, so it is bound through
+/// `authorityDigest` and a request whose payload digest was swapped fails there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlacementAuthority {
+    pub authority_version: u16,
+    pub attempt_id: String,
+    pub authority_digest: Sha256Digest,
+    pub call_digest: Sha256Digest,
+    pub payload_digest: Sha256Digest,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+/// Canonical bytes `authorityDigest` is taken over: the domain, the authority
+/// without its own digest, and the request context (organization, application,
+/// policy, operation and reward ceiling). `requestId` is excluded because the
+/// control plane derives it from this digest.
+pub fn placement_authority_digest_payload(
+    context: &RequestContext,
+    authority: &PlacementAuthority,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut authority = serde_json::to_value(authority)?;
+    if let Value::Object(fields) = &mut authority {
+        fields.remove("authorityDigest");
+    }
+    Ok(canonical_json(&Value::Array(vec![
+        Value::String(PLACEMENT_AUTHORITY_DIGEST_DOMAIN.to_string()),
+        authority,
+        serde_json::to_value(context)?,
+    ]))
+    .into_bytes())
+}
+
+pub fn placement_authority_digest(
+    context: &RequestContext,
+    authority: &PlacementAuthority,
+) -> Result<Sha256Digest, serde_json::Error> {
+    Ok(Sha256Digest::from_bytes(
+        &placement_authority_digest_payload(context, authority)?,
+    ))
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PlacementAuthorityError {
+    #[error("placement authority is malformed: {0}")]
+    Malformed(&'static str),
+    #[error("placement authority has expired")]
+    Expired,
+    #[error("placement authority does not match the request: {0}")]
+    Mismatch(&'static str),
+}
+
+impl PlacementAuthorityError {
+    pub fn reason(&self) -> SignRejectionReason {
+        match self {
+            Self::Malformed(_) => SignRejectionReason::AuthorityMalformed,
+            Self::Expired => SignRejectionReason::AuthorityExpired,
+            Self::Mismatch(_) => SignRejectionReason::AuthorityMismatch,
+        }
+    }
+}
+
+/// Everything about an authority that needs no chain and no ledger: shape,
+/// window, expiry against `now_ms`, and both digests. The signer runs it before
+/// any balance read, spend reservation or signature; the control plane runs the
+/// same function before it will put a request on the wire.
+pub fn verify_placement_authority(
+    request: &SignRequest,
+    call_bytes: &[u8],
+    now_ms: u64,
+) -> Result<(), PlacementAuthorityError> {
+    let authority = request
+        .authority
+        .as_ref()
+        .ok_or(PlacementAuthorityError::Malformed("authority is missing"))?;
+    if authority.authority_version != PLACEMENT_AUTHORITY_VERSION {
+        return Err(PlacementAuthorityError::Malformed(
+            "authorityVersion unsupported",
+        ));
+    }
+    let attempt_id = authority.attempt_id.as_str();
+    if attempt_id.trim().is_empty() || attempt_id.trim() != attempt_id || attempt_id.len() > 256 {
+        return Err(PlacementAuthorityError::Malformed(
+            "attemptId must be a trimmed non-empty string of at most 256 bytes",
+        ));
+    }
+    if authority.expires_at_ms <= authority.issued_at_ms {
+        return Err(PlacementAuthorityError::Malformed(
+            "expiresAtMs must be after issuedAtMs",
+        ));
+    }
+    if authority.expires_at_ms - authority.issued_at_ms > PLACEMENT_AUTHORITY_MAX_WINDOW_MS {
+        return Err(PlacementAuthorityError::Malformed(
+            "authority window exceeds the maximum",
+        ));
+    }
+    if authority.issued_at_ms > now_ms.saturating_add(PLACEMENT_AUTHORITY_MAX_CLOCK_SKEW_MS) {
+        return Err(PlacementAuthorityError::Malformed(
+            "issuedAtMs is in the future",
+        ));
+    }
+    if now_ms >= authority.expires_at_ms {
+        return Err(PlacementAuthorityError::Expired);
+    }
+    if authority.call_digest != Sha256Digest::from_bytes(call_bytes) {
+        return Err(PlacementAuthorityError::Mismatch(
+            "callDigest does not match the call bytes",
+        ));
+    }
+    let expected = placement_authority_digest(&request.context, authority)
+        .map_err(|_| PlacementAuthorityError::Malformed("authority does not serialize"))?;
+    if authority.authority_digest != expected {
+        return Err(PlacementAuthorityError::Mismatch(
+            "authorityDigest does not match the authority and request context",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -503,10 +668,36 @@ pub struct SignRejected {
     pub reason: SignRejectionReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Version 2 only. `preSubmit` is the daemon's statement that nothing was
+    /// broadcast; `postSubmit` means a transaction may exist. Absent — every
+    /// version-1 rejection — is not evidence either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<SignRejectionPhase>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignRejectionPhase {
+    #[serde(rename = "preSubmit")]
+    PreSubmit,
+    #[serde(rename = "postSubmit")]
+    PostSubmit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SignRejectionReason {
+    /// Version 2 only: the authority's window has closed.
+    #[serde(rename = "authorityExpired")]
+    AuthorityExpired,
+    /// Version 2 only: a digest does not match the call or request context.
+    #[serde(rename = "authorityMismatch")]
+    AuthorityMismatch,
+    /// Version 2 only: the authority is absent, unsupported or ill-formed.
+    #[serde(rename = "authorityMalformed")]
+    AuthorityMalformed,
+    /// Version 2 only: this attempt was already reserved for a different
+    /// request or call.
+    #[serde(rename = "authorityReplayed")]
+    AuthorityReplayed,
     #[serde(rename = "operationNotAllowed")]
     OperationNotAllowed,
     #[serde(rename = "metadataMismatch")]
@@ -890,7 +1081,9 @@ mod tests {
                     )),
                     rpc_url: Some("wss://acurast.rpc.proof.computer".to_owned()),
                 },
+                authority: None,
             }),
+            Envelope::SignRequest(authority_request(1_775_000_000_000)),
             Envelope::SignResult(SignResult {
                 request_id: "req-sign".to_owned(),
                 tx_hash: hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -904,6 +1097,13 @@ mod tests {
                 request_id: "req-sign".to_owned(),
                 reason: SignRejectionReason::MetadataMismatch,
                 message: Some("runtime metadata mismatch".to_owned()),
+                phase: None,
+            }),
+            Envelope::SignRejected(SignRejected {
+                request_id: "req-sign".to_owned(),
+                reason: SignRejectionReason::AuthorityExpired,
+                message: Some("placement authority has expired".to_owned()),
+                phase: Some(SignRejectionPhase::PreSubmit),
             }),
             Envelope::SecretSyncRequest(secret_sync_request()),
             Envelope::SecretSyncResult(SecretSyncResult {
@@ -1328,6 +1528,379 @@ applicationId:app_456\n\
 origin:https://api.liskov.proof.computer\n\
 address:5FSignerAddress"
         );
+    }
+
+    const AUTHORITY_ISSUED_AT_MS: u64 = 1_775_000_000_000;
+    const AUTHORITY_CALL_BYTES: [u8; 4] = [0x04, 0x01, 0x02, 0x03];
+
+    /// A version-2 request whose authority is sealed over its own context.
+    fn authority_request(issued_at_ms: u64) -> SignRequest {
+        let mut request = SignRequest {
+            request_id: "req-sign-authority".to_owned(),
+            call_bytes_hex: hex("0x04010203"),
+            context: RequestContext {
+                organization_id: "org_123".to_owned(),
+                application_id: "app_456".to_owned(),
+                policy_digest: Some(hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+                policy_version_id: Some("pv_789".to_owned()),
+                operation: Operation::AcurastMarketplaceDeploy,
+                max_reward_planck: Some(planck("1000")),
+            },
+            acurast: AcurastRuntimeMetadata {
+                genesis_hash: hex(
+                    "0x1111111111111111111111111111111111111111111111111111111111111111",
+                ),
+                spec_name: "acurast".to_owned(),
+                spec_version: 1_000,
+                transaction_version: 25,
+                metadata_hash: Some(hex(
+                    "0x2222222222222222222222222222222222222222222222222222222222222222",
+                )),
+                rpc_url: None,
+            },
+            authority: Some(PlacementAuthority {
+                authority_version: PLACEMENT_AUTHORITY_VERSION,
+                attempt_id: "occ_1:attempt_1".to_owned(),
+                authority_digest: sha(
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                ),
+                call_digest: Sha256Digest::from_bytes(&AUTHORITY_CALL_BYTES),
+                payload_digest: sha(
+                    "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                ),
+                issued_at_ms,
+                expires_at_ms: issued_at_ms + 120_000,
+            }),
+        };
+        reseal(&mut request);
+        request
+    }
+
+    /// One named, deliberate change to an otherwise valid request.
+    type RequestEdit = (&'static str, fn(&mut SignRequest));
+
+    /// Recompute `authorityDigest` after a deliberate edit, so a test can
+    /// isolate one check from the digest check that would otherwise catch it.
+    fn reseal(request: &mut SignRequest) {
+        let digest = placement_authority_digest(
+            &request.context,
+            request.authority.as_ref().expect("authority present"),
+        )
+        .expect("digest computes");
+        request
+            .authority
+            .as_mut()
+            .expect("authority present")
+            .authority_digest = digest;
+    }
+
+    #[test]
+    fn placement_authority_accepts_the_exact_request_inside_its_window() {
+        let request = authority_request(AUTHORITY_ISSUED_AT_MS);
+        for now in [
+            AUTHORITY_ISSUED_AT_MS,
+            AUTHORITY_ISSUED_AT_MS + 119_999,
+            // A signer clock slightly behind the issuer is not a refusal.
+            AUTHORITY_ISSUED_AT_MS - PLACEMENT_AUTHORITY_MAX_CLOCK_SKEW_MS,
+        ] {
+            assert_eq!(
+                verify_placement_authority(&request, &AUTHORITY_CALL_BYTES, now),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn placement_authority_expires_at_its_expiry_instant() {
+        let request = authority_request(AUTHORITY_ISSUED_AT_MS);
+        for now in [
+            AUTHORITY_ISSUED_AT_MS + 120_000,
+            AUTHORITY_ISSUED_AT_MS + 900_000,
+        ] {
+            let error = verify_placement_authority(&request, &AUTHORITY_CALL_BYTES, now)
+                .expect_err("expired");
+            assert_eq!(error, PlacementAuthorityError::Expired);
+            assert_eq!(error.reason(), SignRejectionReason::AuthorityExpired);
+        }
+    }
+
+    #[test]
+    fn placement_authority_rejects_a_different_call() {
+        let request = authority_request(AUTHORITY_ISSUED_AT_MS);
+        let error =
+            verify_placement_authority(&request, &[0x04, 0x01, 0x02, 0x04], AUTHORITY_ISSUED_AT_MS)
+                .expect_err("wrong call");
+        assert_eq!(error.reason(), SignRejectionReason::AuthorityMismatch);
+    }
+
+    #[test]
+    fn placement_authority_rejects_every_unsealed_field_change() {
+        let edits: Vec<RequestEdit> = vec![
+            ("payload", |r| {
+                r.authority.as_mut().unwrap().payload_digest =
+                    sha("sha256:6666666666666666666666666666666666666666666666666666666666666666")
+            }),
+            ("foreign attempt", |r| {
+                r.authority.as_mut().unwrap().attempt_id = "occ_1:attempt_2".to_owned()
+            }),
+            ("later expiry", |r| {
+                r.authority.as_mut().unwrap().expires_at_ms += 1
+            }),
+            ("organization", |r| {
+                r.context.organization_id = "org_999".to_owned()
+            }),
+            ("application", |r| {
+                r.context.application_id = "app_999".to_owned()
+            }),
+            ("operation", |r| {
+                r.context.operation = Operation::AcurastRegister
+            }),
+            ("reward ceiling", |r| {
+                r.context.max_reward_planck = Some(planck("1001"))
+            }),
+            ("policy", |r| r.context.policy_version_id = None),
+        ];
+        for (name, edit) in edits {
+            let mut request = authority_request(AUTHORITY_ISSUED_AT_MS);
+            edit(&mut request);
+            let error =
+                verify_placement_authority(&request, &AUTHORITY_CALL_BYTES, AUTHORITY_ISSUED_AT_MS)
+                    .expect_err(name);
+            assert_eq!(
+                error.reason(),
+                SignRejectionReason::AuthorityMismatch,
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_authority_rejects_malformed_authority() {
+        let edits: Vec<RequestEdit> = vec![
+            ("missing", |r| r.authority = None),
+            ("version", |r| {
+                r.authority.as_mut().unwrap().authority_version = PLACEMENT_AUTHORITY_VERSION + 1
+            }),
+            ("empty attempt", |r| {
+                r.authority.as_mut().unwrap().attempt_id = String::new()
+            }),
+            ("padded attempt", |r| {
+                r.authority.as_mut().unwrap().attempt_id = " occ_1:attempt_1".to_owned()
+            }),
+            ("inverted window", |r| {
+                let authority = r.authority.as_mut().unwrap();
+                authority.expires_at_ms = authority.issued_at_ms;
+            }),
+            ("window too long", |r| {
+                let authority = r.authority.as_mut().unwrap();
+                authority.expires_at_ms =
+                    authority.issued_at_ms + PLACEMENT_AUTHORITY_MAX_WINDOW_MS + 1;
+            }),
+        ];
+        for (name, edit) in edits {
+            let mut request = authority_request(AUTHORITY_ISSUED_AT_MS);
+            edit(&mut request);
+            if request.authority.is_some() {
+                // Sealed, so only the malformation itself can refuse it.
+                reseal(&mut request);
+            }
+            let error =
+                verify_placement_authority(&request, &AUTHORITY_CALL_BYTES, AUTHORITY_ISSUED_AT_MS)
+                    .expect_err(name);
+            assert_eq!(
+                error.reason(),
+                SignRejectionReason::AuthorityMalformed,
+                "{name}: {error}"
+            );
+        }
+
+        let future = authority_request(AUTHORITY_ISSUED_AT_MS);
+        let error = verify_placement_authority(
+            &future,
+            &AUTHORITY_CALL_BYTES,
+            AUTHORITY_ISSUED_AT_MS - PLACEMENT_AUTHORITY_MAX_CLOCK_SKEW_MS - 1,
+        )
+        .expect_err("issued in the future");
+        assert_eq!(error.reason(), SignRejectionReason::AuthorityMalformed);
+    }
+
+    #[test]
+    fn an_authority_free_request_keeps_its_version_one_bytes() {
+        let mut request = authority_request(AUTHORITY_ISSUED_AT_MS);
+        request.authority = None;
+        let encoded = serde_json::to_value(Envelope::SignRequest(request)).expect("serializes");
+        assert!(encoded["payload"].get("authority").is_none());
+
+        let rejected = serde_json::to_value(Envelope::SignRejected(SignRejected {
+            request_id: "req-sign".to_owned(),
+            reason: SignRejectionReason::MetadataMismatch,
+            message: None,
+            phase: None,
+        }))
+        .expect("serializes");
+        assert_eq!(
+            rejected,
+            json!({
+                "type": "sign.rejected",
+                "payload": { "requestId": "req-sign", "reason": "metadataMismatch" }
+            })
+        );
+    }
+
+    #[test]
+    fn supported_protocol_versions_are_exactly_one_and_two() {
+        assert!(is_supported_protocol_version(LEGACY_PROTOCOL_VERSION));
+        assert!(is_supported_protocol_version(
+            PLACEMENT_AUTHORITY_PROTOCOL_VERSION
+        ));
+        assert!(!is_supported_protocol_version(0));
+        assert!(!is_supported_protocol_version(3));
+    }
+
+    /// The fallback depends on this: a version-1 control plane must be able to
+    /// *parse* a version-2 hello, or it answers `badRequest` instead of
+    /// `protocolVersionUnsupported` and the daemon never downgrades.
+    #[test]
+    fn a_version_two_hello_differs_from_version_one_only_in_its_number() {
+        let hello = |protocol_version| {
+            serde_json::to_value(Envelope::ClientHello(ClientHello {
+                protocol_version,
+                signer_version: "0.2.0".to_owned(),
+                address: "5FSignerAddress".to_owned(),
+                capabilities: vec![
+                    SignerCapability::SignDeployLifecycle,
+                    SignerCapability::PrepareLiskovSecretsFromSecretSources,
+                ],
+            }))
+            .expect("hello serializes")
+        };
+        let mut v2 = hello(PLACEMENT_AUTHORITY_PROTOCOL_VERSION);
+        assert_eq!(v2["payload"]["protocolVersion"], json!(2));
+        v2["payload"]["protocolVersion"] = json!(LEGACY_PROTOCOL_VERSION);
+        assert_eq!(v2, hello(LEGACY_PROTOCOL_VERSION));
+    }
+
+    /// The cross-repository golden for the version-2 sign wire. `liskov-rs`
+    /// mirrors this file byte-for-byte and reads it with its own types.
+    fn sign_protocol_golden() -> Value {
+        let request = authority_request(AUTHORITY_ISSUED_AT_MS);
+        let authority = request.authority.clone().expect("authority present");
+        let payload = String::from_utf8(
+            placement_authority_digest_payload(&request.context, &authority)
+                .expect("payload serializes"),
+        )
+        .expect("payload is utf8");
+        let mut legacy = request.clone();
+        legacy.authority = None;
+        let wire = |envelope: &Envelope| serde_json::to_string(envelope).expect("serializes");
+        json!({
+            "packet": "BKLG-20260820-9ldj",
+            "protocolVersions": {
+                "legacy": LEGACY_PROTOCOL_VERSION,
+                "placementAuthority": PLACEMENT_AUTHORITY_PROTOCOL_VERSION,
+            },
+            "authorityVersion": PLACEMENT_AUTHORITY_VERSION,
+            "domain": PLACEMENT_AUTHORITY_DIGEST_DOMAIN,
+            "maxWindowMs": PLACEMENT_AUTHORITY_MAX_WINDOW_MS,
+            "maxClockSkewMs": PLACEMENT_AUTHORITY_MAX_CLOCK_SKEW_MS,
+            "callBytesHex": "0x04010203",
+            "canonicalAuthorityPayload": payload,
+            "authorityDigest": authority.authority_digest,
+            "wire": {
+                "helloV1": wire(&Envelope::ClientHello(ClientHello {
+                    protocol_version: LEGACY_PROTOCOL_VERSION,
+                    signer_version: "0.2.0".to_owned(),
+                    address: "5FSignerAddress".to_owned(),
+                    capabilities: vec![
+                        SignerCapability::SignDeployLifecycle,
+                        SignerCapability::PrepareLiskovSecretsFromSecretSources,
+                    ],
+                })),
+                "helloV2": wire(&Envelope::ClientHello(ClientHello {
+                    protocol_version: PLACEMENT_AUTHORITY_PROTOCOL_VERSION,
+                    signer_version: "0.2.0".to_owned(),
+                    address: "5FSignerAddress".to_owned(),
+                    capabilities: vec![
+                        SignerCapability::SignDeployLifecycle,
+                        SignerCapability::PrepareLiskovSecretsFromSecretSources,
+                    ],
+                })),
+                "readyV2": wire(&Envelope::ServerReady(ServerReady {
+                    organization_id: "org_123".to_owned(),
+                    application_id: "app_456".to_owned(),
+                    address: "5FSignerAddress".to_owned(),
+                    protocol_version: PLACEMENT_AUTHORITY_PROTOCOL_VERSION,
+                })),
+                "signRequestV1": wire(&Envelope::SignRequest(legacy)),
+                "signRequestV2": wire(&Envelope::SignRequest(request)),
+                "signResult": wire(&Envelope::SignResult(SignResult {
+                    request_id: "req-sign-authority".to_owned(),
+                    tx_hash: hex(
+                        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    ),
+                    finalized_events: None,
+                })),
+                "rejectedPreSubmit": wire(&Envelope::SignRejected(SignRejected {
+                    request_id: "req-sign-authority".to_owned(),
+                    reason: SignRejectionReason::AuthorityExpired,
+                    message: None,
+                    phase: Some(SignRejectionPhase::PreSubmit),
+                })),
+                "rejectedPostSubmit": wire(&Envelope::SignRejected(SignRejected {
+                    request_id: "req-sign-authority".to_owned(),
+                    reason: SignRejectionReason::SigningUnavailable,
+                    message: None,
+                    phase: Some(SignRejectionPhase::PostSubmit),
+                })),
+            },
+            "stableRejections": [
+                SignRejectionReason::AuthorityExpired,
+                SignRejectionReason::AuthorityMismatch,
+                SignRejectionReason::AuthorityMalformed,
+                SignRejectionReason::AuthorityReplayed,
+            ],
+        })
+    }
+
+    const SIGN_PROTOCOL_GOLDEN_PATH: &str = "../../fixtures/sign-protocol-v2.json";
+
+    #[test]
+    fn sign_protocol_golden_vector_is_stable() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../fixtures/sign-protocol-v2.json"))
+                .expect("golden fixture parses");
+        assert_eq!(
+            fixture,
+            sign_protocol_golden(),
+            "the committed sign-protocol golden drifted; regenerate it only for a deliberate \
+             wire change, and mirror it into liskov-rs in the same change"
+        );
+        let request = match serde_json::from_str::<Envelope>(
+            fixture["wire"]["signRequestV2"]
+                .as_str()
+                .expect("request string"),
+        )
+        .expect("request decodes")
+        {
+            Envelope::SignRequest(request) => request,
+            other => panic!("expected a sign request, got {other:?}"),
+        };
+        assert_eq!(
+            verify_placement_authority(&request, &AUTHORITY_CALL_BYTES, AUTHORITY_ISSUED_AT_MS),
+            Ok(())
+        );
+    }
+
+    /// Rewrites the golden. Run only for a deliberate wire change:
+    /// `cargo test -p liskov-self-custody-proto write_sign_protocol_golden -- --ignored`
+    #[test]
+    #[ignore = "writes fixtures/sign-protocol-v2.json"]
+    fn write_sign_protocol_golden() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SIGN_PROTOCOL_GOLDEN_PATH);
+        let mut text =
+            serde_json::to_string_pretty(&sign_protocol_golden()).expect("golden serializes");
+        text.push('\n');
+        std::fs::write(path, text).expect("write golden");
     }
 
     fn hex(value: &str) -> HexString {

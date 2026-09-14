@@ -16,11 +16,13 @@ use blake2::{Blake2b512, Digest};
 use clap::{Args, Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use liskov_self_custody_proto::{
-    challenge_signing_payload, AcurastRuntimeMetadata, ChainEvent, ChallengeResponse, ClientHello,
-    Envelope, ErrorCode, HexString, Operation, SecretSyncRejected, SecretSyncRejectionReason,
-    SecretSyncRequest, ServerReady, SignRejected, SignRejectionReason, SignRequest, SignResult,
-    SignerCapability, SignerSecretReleaseRejected, SignerSecretReleaseRejectionReason,
-    SignerSecretReleaseRequest, PROTOCOL_VERSION,
+    challenge_signing_payload, verify_placement_authority, AcurastRuntimeMetadata, ChainEvent,
+    ChallengeResponse, ClientHello, Envelope, ErrorCode, HexString, Operation, SecretSyncRejected,
+    SecretSyncRejectionReason, SecretSyncRequest, ServerReady, SignRejected, SignRejectionPhase,
+    SignRejectionReason, SignRequest, SignResult, SignerCapability, SignerSecretReleaseRejected,
+    SignerSecretReleaseRejectionReason, SignerSecretReleaseRequest, LEGACY_PROTOCOL_VERSION,
+    PLACEMENT_AUTHORITY_MAX_CLOCK_SKEW_MS, PLACEMENT_AUTHORITY_MAX_WINDOW_MS,
+    PLACEMENT_AUTHORITY_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use schnorrkel::{ExpansionMode, MiniSecretKey};
 use serde::{Deserialize, Serialize};
@@ -290,8 +292,28 @@ where
     C: AcurastClient,
 {
     async fn run_forever(self) -> Result<(), SignerError> {
+        // Offer the newest wire first. A control plane that predates it answers
+        // `protocolVersionUnsupported`; reconnect once at version 1, which
+        // keeps legacy signing working and can never carry a placement
+        // authority. A refusal at version 1 is fatal, exactly as before.
+        let mut offered_version = PROTOCOL_VERSION;
         loop {
-            match self.run_socket_once().await {
+            match self.run_socket_once(offered_version).await {
+                Err(error)
+                    if error.is_protocol_version_unsupported()
+                        && offered_version > LEGACY_PROTOCOL_VERSION =>
+                {
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "level": "warn",
+                            "component": "liskov-self-custody-signer",
+                            "message": "control plane does not speak protocol v2; reconnecting at protocol v1 without placement-authority signing",
+                        })
+                    );
+                    offered_version = LEGACY_PROTOCOL_VERSION;
+                    continue;
+                }
                 Err(error) if error.is_fatal_handshake() => {
                     eprintln!(
                         "{}",
@@ -319,13 +341,13 @@ where
         }
     }
 
-    async fn run_socket_once(&self) -> Result<(), SignerError> {
+    async fn run_socket_once(&self, offered_version: u16) -> Result<(), SignerError> {
         let url = self.connect_url()?;
         let (mut socket, _) = connect_async(url).await.map_err(map_connect_error)?;
         send_envelope(
             &mut socket,
             &Envelope::ClientHello(ClientHello {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: offered_version,
                 signer_version: env!("CARGO_PKG_VERSION").to_string(),
                 address: self.signer.address().to_string(),
                 capabilities: advertised_capabilities(),
@@ -355,11 +377,13 @@ where
                         .await?;
                     }
                     Ok(Envelope::ServerReady(ready)) => {
-                        self.persist_ready(&ready)?;
+                        self.persist_ready(&ready, offered_version)?;
                         ready_seen = true;
                     }
                     Ok(Envelope::SignRequest(request)) => {
-                        let response = self.handle_sign_request(request).await;
+                        let response = self
+                            .handle_sign_request(request, offered_version, &now_epoch_ms)
+                            .await;
                         send_envelope(&mut socket, &response).await?;
                     }
                     Ok(Envelope::SecretSyncRequest(request)) => {
@@ -429,8 +453,11 @@ where
         Ok(url.to_string())
     }
 
-    fn persist_ready(&self, ready: &ServerReady) -> Result<(), SignerError> {
-        if ready.protocol_version != PROTOCOL_VERSION {
+    /// The control plane echoes the version it accepted from our hello. Any
+    /// other number means the two sides disagree about the wire, which is fatal
+    /// rather than something to guess past.
+    fn persist_ready(&self, ready: &ServerReady, offered_version: u16) -> Result<(), SignerError> {
+        if ready.protocol_version != offered_version {
             return Err(SignerError::FatalHandshake {
                 code: "protocolVersionUnsupported".to_string(),
                 message: "server.ready protocolVersion mismatch".to_string(),
@@ -451,13 +478,31 @@ where
         Ok(())
     }
 
-    async fn handle_sign_request(&self, request: SignRequest) -> Envelope {
-        match self.verify_reserve_submit(&request).await {
+    async fn handle_sign_request(
+        &self,
+        request: SignRequest,
+        session_version: u16,
+        now_ms: &(dyn Fn() -> u64 + Send + Sync),
+    ) -> Envelope {
+        let authority_session = session_version >= PLACEMENT_AUTHORITY_PROTOCOL_VERSION;
+        let outcome = if request.authority.is_some() && !authority_session {
+            // A version-1 control plane has no field to put an authority in, so
+            // this cannot come from one. Refuse with a reason its reader knows.
+            Err(Rejection::new(
+                SignRejectionReason::OperationNotAllowed,
+                "placement authority was not negotiated on this session",
+            ))
+        } else {
+            self.verify_reserve_submit(&request, now_ms).await
+        };
+        match outcome {
             Ok(result) => Envelope::SignResult(result),
             Err(rejection) => Envelope::SignRejected(SignRejected {
                 request_id: request.request_id,
                 reason: rejection.reason,
                 message: rejection.message,
+                // A version-1 reader refuses the whole frame on an unknown field.
+                phase: authority_session.then_some(rejection.phase),
             }),
         }
     }
@@ -478,7 +523,27 @@ where
         })
     }
 
-    async fn verify_reserve_submit(&self, request: &SignRequest) -> Result<SignResult, Rejection> {
+    async fn verify_reserve_submit(
+        &self,
+        request: &SignRequest,
+        now_ms: &(dyn Fn() -> u64 + Send + Sync),
+    ) -> Result<SignResult, Rejection> {
+        // The authority needs no chain. An expired, foreign or mismatched
+        // request is refused before any RPC, balance read or reservation.
+        let attempt = match request.authority.as_ref() {
+            Some(authority) => {
+                let call_bytes = decode_hex_string(&request.call_bytes_hex).map_err(|_| {
+                    Rejection::new(SignRejectionReason::InvalidCallBytes, "bad callBytesHex")
+                })?;
+                verify_placement_authority(request, &call_bytes, now_ms())
+                    .map_err(|error| Rejection::new(error.reason(), error.to_string()))?;
+                Some(AttemptBinding {
+                    attempt_id: authority.attempt_id.clone(),
+                    call_digest: authority.call_digest.to_string(),
+                })
+            }
+            None => None,
+        };
         let runtime = self
             .chain
             .runtime_snapshot()
@@ -486,25 +551,51 @@ where
             .map_err(|error| Rejection::signing_unavailable(&error))?;
         let verified = verify_sign_request(request, &runtime)?;
         self.ensure_acu_balance_preflight(&verified).await?;
-        if let Some(reward_escrow) = verified.reward_escrow_planck {
-            self.spend
-                .reserve(&request.request_id, reward_escrow, now_epoch_seconds())
-                .map_err(|error| Rejection::new(SignRejectionReason::RewardCapExceeded, error))?;
+        // The RPC reads above can be slow. An authority that lapsed while we
+        // waited on them is not signed.
+        if let Some(authority) = request.authority.as_ref() {
+            if now_ms() >= authority.expires_at_ms {
+                return Err(Rejection::new(
+                    SignRejectionReason::AuthorityExpired,
+                    "placement authority expired before signing",
+                ));
+            }
         }
+        match (&attempt, verified.reward_escrow_planck) {
+            // Every authority-bound request is recorded, spending or not, so a
+            // replayed attempt is refused whatever call it names.
+            (Some(attempt), escrow) => self
+                .spend
+                .reserve_attempt(
+                    &request.request_id,
+                    attempt,
+                    escrow.unwrap_or(0),
+                    now_epoch_seconds(),
+                )
+                .map_err(SpendRefusal::into_rejection)?,
+            (None, Some(reward_escrow)) => self
+                .spend
+                .reserve(&request.request_id, reward_escrow, now_epoch_seconds())
+                .map_err(|error| Rejection::new(SignRejectionReason::RewardCapExceeded, error))?,
+            (None, None) => {}
+        }
+        // From here the transaction may exist whatever the error says, so every
+        // refusal is post-submit and proves nothing about spend.
         let submitted = self
             .chain
             .submit_call(&verified.call_bytes, &self.signer)
             .await
-            .map_err(|error| Rejection::signing_unavailable(&error))?;
-        if verified.reward_escrow_planck.is_some() {
+            .map_err(|error| Rejection::signing_unavailable(&error).after_submit())?;
+        if verified.reward_escrow_planck.is_some() || attempt.is_some() {
             self.spend
                 .confirm(&request.request_id, submitted.finalized_at_epoch_seconds)
-                .map_err(|error| Rejection::signing_unavailable(&error))?;
+                .map_err(|error| Rejection::signing_unavailable(&error).after_submit())?;
         }
         Ok(SignResult {
             request_id: request.request_id.clone(),
-            tx_hash: HexString::new(submitted.tx_hash)
-                .map_err(|error| Rejection::signing_unavailable(&error.to_string()))?,
+            tx_hash: HexString::new(submitted.tx_hash).map_err(|error| {
+                Rejection::signing_unavailable(&error.to_string()).after_submit()
+            })?,
             finalized_events: if matches!(
                 verified.operation,
                 Operation::AcurastRegister | Operation::AcurastMarketplaceDeploy
@@ -555,6 +646,13 @@ fn advertised_capabilities() -> Vec<SignerCapability> {
         SignerCapability::SignDeployLifecycle,
         SignerCapability::PrepareLiskovSecretsFromSecretSources,
     ]
+}
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 async fn send_envelope<S>(socket: &mut S, envelope: &Envelope) -> Result<(), SignerError>
@@ -1055,7 +1153,48 @@ struct SpendReservation {
     reserved_at_epoch_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     confirmed_at_epoch_seconds: Option<u64>,
+    /// Version-2 requests only: the placement attempt this reservation
+    /// consumed, and the call it was for. Absent on every older entry, which
+    /// is why an existing ledger file still loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    call_digest: Option<String>,
 }
+
+/// The placement attempt an authority-bound request would consume.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttemptBinding {
+    pub attempt_id: String,
+    pub call_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpendRefusal {
+    /// The attempt already has a reservation, for this request or another.
+    AttemptReplayed,
+    Refused(String),
+}
+
+impl SpendRefusal {
+    fn into_rejection(self) -> Rejection {
+        match self {
+            Self::AttemptReplayed => Rejection::new(
+                SignRejectionReason::AuthorityReplayed,
+                "placement attempt already has a spend reservation",
+            ),
+            Self::Refused(message) => {
+                Rejection::new(SignRejectionReason::RewardCapExceeded, message)
+            }
+        }
+    }
+}
+
+/// An attempt's record must outlive every authority that could name it, or a
+/// replay late in a long authority window would find the record already
+/// pruned by a short spend window.
+const ATTEMPT_RECORD_RETENTION_SECONDS: u64 =
+    (PLACEMENT_AUTHORITY_MAX_WINDOW_MS + PLACEMENT_AUTHORITY_MAX_CLOCK_SKEW_MS) / 1_000 + 1;
 
 impl SpendLedger {
     pub fn new(path: PathBuf, limits: SpendLimits) -> Self {
@@ -1063,37 +1202,82 @@ impl SpendLedger {
     }
 
     pub fn reserve(&self, request_id: &str, amount: u128, now_seconds: u64) -> Result<(), String> {
+        self.reserve_inner(request_id, None, amount, now_seconds)
+            .map_err(|refusal| match refusal {
+                SpendRefusal::AttemptReplayed => {
+                    "placement attempt already has a spend reservation".to_string()
+                }
+                SpendRefusal::Refused(message) => message,
+            })
+    }
+
+    /// Reserve for an authority-bound request. `amount` may be zero — a
+    /// non-spending call still consumes its attempt.
+    pub fn reserve_attempt(
+        &self,
+        request_id: &str,
+        attempt: &AttemptBinding,
+        amount: u128,
+        now_seconds: u64,
+    ) -> Result<(), SpendRefusal> {
+        self.reserve_inner(request_id, Some(attempt), amount, now_seconds)
+    }
+
+    fn reserve_inner(
+        &self,
+        request_id: &str,
+        attempt: Option<&AttemptBinding>,
+        amount: u128,
+        now_seconds: u64,
+    ) -> Result<(), SpendRefusal> {
+        let refused = |message: &str| SpendRefusal::Refused(message.to_string());
         if amount > self.limits.max_reward_per_request_planck {
-            return Err("reward escrow exceeds maxRewardPerRequestPlanck".to_string());
+            return Err(refused("reward escrow exceeds maxRewardPerRequestPlanck"));
         }
-        let mut ledger = self.load().map_err(|error| error.to_string())?;
-        prune_spend_ledger(&mut ledger, self.limits.spend_window_seconds, now_seconds);
+        let mut ledger = self
+            .load()
+            .map_err(|error| SpendRefusal::Refused(error.to_string()))?;
+        let window_seconds = self.limits.spend_window_seconds;
+        prune_spend_ledger(&mut ledger, window_seconds, now_seconds);
+        // Checked first: a replay is named as a replay even when it would also
+        // break a cap.
+        if let Some(attempt) = attempt {
+            if ledger.reservations.iter().any(|reservation| {
+                reservation.attempt_id.as_deref() == Some(attempt.attempt_id.as_str())
+            }) {
+                return Err(SpendRefusal::AttemptReplayed);
+            }
+        }
         let used = ledger
             .reservations
             .iter()
+            .filter(|reservation| within_spend_window(reservation, window_seconds, now_seconds))
             .filter_map(|reservation| reservation.amount_planck.parse::<u128>().ok())
             .try_fold(0u128, |total, amount| total.checked_add(amount))
-            .ok_or_else(|| "spend window total overflowed".to_string())?;
+            .ok_or_else(|| refused("spend window total overflowed"))?;
         let next = used
             .checked_add(amount)
-            .ok_or_else(|| "spend window total overflowed".to_string())?;
+            .ok_or_else(|| refused("spend window total overflowed"))?;
         if next > self.limits.spend_window_planck {
-            return Err("reward escrow exceeds rolling spend window".to_string());
+            return Err(refused("reward escrow exceeds rolling spend window"));
         }
         if ledger
             .reservations
             .iter()
             .any(|reservation| reservation.request_id == request_id)
         {
-            return Err("request already has a spend reservation".to_string());
+            return Err(refused("request already has a spend reservation"));
         }
         ledger.reservations.push(SpendReservation {
             request_id: request_id.to_string(),
             amount_planck: amount.to_string(),
             reserved_at_epoch_seconds: now_seconds,
             confirmed_at_epoch_seconds: None,
+            attempt_id: attempt.map(|attempt| attempt.attempt_id.clone()),
+            call_digest: attempt.map(|attempt| attempt.call_digest.clone()),
         });
-        atomic_write_json(&self.path, &ledger).map_err(|error| error.to_string())
+        atomic_write_json(&self.path, &ledger)
+            .map_err(|error| SpendRefusal::Refused(error.to_string()))
     }
 
     pub fn confirm(&self, request_id: &str, now_seconds: u64) -> Result<(), String> {
@@ -1127,8 +1311,21 @@ impl SpendLedger {
 
 fn prune_spend_ledger(ledger: &mut SpendLedgerFile, window_seconds: u64, now_seconds: u64) {
     ledger.reservations.retain(|reservation| {
-        now_seconds.saturating_sub(reservation.reserved_at_epoch_seconds) <= window_seconds
+        within_spend_window(reservation, window_seconds, now_seconds)
+            || (reservation.attempt_id.is_some()
+                && now_seconds.saturating_sub(reservation.reserved_at_epoch_seconds)
+                    <= ATTEMPT_RECORD_RETENTION_SECONDS)
     });
+}
+
+/// Only reservations inside the spend window count against it; an attempt
+/// record kept longer for replay protection does not.
+fn within_spend_window(
+    reservation: &SpendReservation,
+    window_seconds: u64,
+    now_seconds: u64,
+) -> bool {
+    now_seconds.saturating_sub(reservation.reserved_at_epoch_seconds) <= window_seconds
 }
 
 #[derive(Clone, Debug)]
@@ -1573,6 +1770,9 @@ fn metadata_hash_hex(metadata: &Metadata) -> String {
 pub struct Rejection {
     reason: SignRejectionReason,
     message: Option<String>,
+    /// Whether the call could have reached the chain. Put on the wire only on
+    /// a version-2 session.
+    phase: SignRejectionPhase,
 }
 
 impl Rejection {
@@ -1580,11 +1780,19 @@ impl Rejection {
         Self {
             reason,
             message: Some(message.into()),
+            phase: SignRejectionPhase::PreSubmit,
         }
     }
 
     fn signing_unavailable(message: &str) -> Self {
         Self::new(SignRejectionReason::SigningUnavailable, message)
+    }
+
+    /// Once `submit_call` has been invoked the transaction may exist, whatever
+    /// the error that came back says.
+    fn after_submit(mut self) -> Self {
+        self.phase = SignRejectionPhase::PostSubmit;
+        self
     }
 }
 
@@ -1634,6 +1842,10 @@ pub enum SignerError {
 impl SignerError {
     fn is_fatal_handshake(&self) -> bool {
         matches!(self, Self::FatalHandshake { .. })
+    }
+
+    fn is_protocol_version_unsupported(&self) -> bool {
+        matches!(self, Self::FatalHandshake { code, .. } if code == "protocolVersionUnsupported")
     }
 }
 
@@ -1805,9 +2017,10 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use liskov_self_custody_proto::{
-        ErrorMessage, LiskovSecretsUploadTarget, SecretCustodyMode, SecretSourceDeclaration,
+        placement_authority_digest, DecimalPlanck, ErrorMessage, LiskovSecretsUploadTarget,
+        PlacementAuthority, RequestContext, SecretCustodyMode, SecretSourceDeclaration,
         SecretSourceKind, SecretSourceRef, SecretSyncContext, SecretTarget, SecretTargetKind,
-        Sha256Digest, SignerSecretManifest,
+        Sha256Digest, SignerSecretManifest, PLACEMENT_AUTHORITY_VERSION,
     };
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -2019,12 +2232,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let runtime = test_runtime_with_free_balance(dir.path(), Some(1), 1);
         let error = runtime
-            .persist_ready(&ServerReady {
-                organization_id: "org-1".to_string(),
-                application_id: "app-1".to_string(),
-                address: runtime.signer.address().to_string(),
-                protocol_version: PROTOCOL_VERSION + 1,
-            })
+            .persist_ready(
+                &ServerReady {
+                    organization_id: "org-1".to_string(),
+                    application_id: "app-1".to_string(),
+                    address: runtime.signer.address().to_string(),
+                    protocol_version: PROTOCOL_VERSION + 1,
+                },
+                PROTOCOL_VERSION,
+            )
             .expect_err("protocol mismatch is fatal");
         assert!(error.is_fatal_handshake());
         let rendered = error.to_string();
@@ -2069,7 +2285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_version_error_envelope_exits_without_retry() {
+    async fn protocol_version_error_downgrades_once_then_exits_without_retry() {
         use tokio::net::TcpListener;
         use tokio_tungstenite::accept_async;
 
@@ -2077,36 +2293,354 @@ mod tests {
             .await
             .expect("bind envelope listener");
         let addr = listener.local_addr().expect("listener addr");
+        let hellos = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = hellos.clone();
+        // A control plane that speaks no version this daemon offers: it refuses
+        // every hello, which is what a version-1 server does to a version-2 one
+        // and what any server does to a version it does not know.
         tokio::spawn(async move {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            let Ok(mut socket) = accept_async(stream).await else {
-                return;
-            };
-            let _ = socket.next().await;
-            let envelope = Envelope::Error(ErrorMessage {
-                request_id: None,
-                code: ErrorCode::ProtocolVersionUnsupported,
-                message: "protocol version unsupported".to_string(),
-            });
-            let Ok(text) = serde_json::to_string(&envelope) else {
-                return;
-            };
-            let _ = socket.send(Message::Text(text)).await;
-            let _ = socket.close(None).await;
+            while let Ok((stream, _)) = listener.accept().await {
+                let Ok(mut socket) = accept_async(stream).await else {
+                    continue;
+                };
+                if let Some(Ok(Message::Text(text))) = socket.next().await {
+                    match serde_json::from_str::<Envelope>(&text) {
+                        Ok(Envelope::ClientHello(hello)) => {
+                            seen.lock().expect("hellos").push(hello.protocol_version)
+                        }
+                        other => panic!("first frame must be a hello, got {other:?}"),
+                    }
+                }
+                let envelope = Envelope::Error(ErrorMessage {
+                    request_id: None,
+                    code: ErrorCode::ProtocolVersionUnsupported,
+                    message: "protocol version unsupported".to_string(),
+                });
+                let Ok(text) = serde_json::to_string(&envelope) else {
+                    return;
+                };
+                let _ = socket.send(Message::Text(text)).await;
+                let _ = socket.close(None).await;
+            }
         });
 
         let dir = tempfile::tempdir().expect("tempdir");
         let runtime = test_runtime_dialing(dir.path(), &format!("ws://{addr}"));
         let error = tokio::time::timeout(Duration::from_secs(2), runtime.run_forever())
             .await
-            .expect("protocol mismatch exits within one round trip")
-            .expect_err("protocol mismatch is fatal");
+            .expect("the downgrade is immediate, not a reconnect delay")
+            .expect_err("protocol mismatch at version 1 is fatal");
         let rendered = error.to_string();
         assert!(error.is_fatal_handshake());
         assert!(rendered.contains("protocolVersionUnsupported"));
         assert!(!rendered.contains("test-pairing-token"));
+        assert_eq!(
+            *hellos.lock().expect("hellos"),
+            vec![
+                PLACEMENT_AUTHORITY_PROTOCOL_VERSION,
+                LEGACY_PROTOCOL_VERSION
+            ],
+            "offer version 2, fall back to version 1 exactly once"
+        );
+    }
+
+    #[test]
+    fn persist_ready_requires_the_offered_version_echoed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime_with_free_balance(dir.path(), Some(1), 1);
+        let ready = |protocol_version| ServerReady {
+            organization_id: "org-1".to_string(),
+            application_id: "app-1".to_string(),
+            address: runtime.signer.address().to_string(),
+            protocol_version,
+        };
+        for version in [
+            LEGACY_PROTOCOL_VERSION,
+            PLACEMENT_AUTHORITY_PROTOCOL_VERSION,
+        ] {
+            runtime
+                .persist_ready(&ready(version), version)
+                .expect("an echoed version is accepted");
+        }
+        // Offered 2, told 1: the server did not accept what we sent.
+        assert!(runtime
+            .persist_ready(
+                &ready(LEGACY_PROTOCOL_VERSION),
+                PLACEMENT_AUTHORITY_PROTOCOL_VERSION
+            )
+            .expect_err("a downgraded ready is not silently accepted")
+            .is_fatal_handshake());
+    }
+
+    const TEST_CALL_BYTES_HEX: &str = "0x04010203";
+
+    /// A request the placement check alone can decide: the fake chain has no
+    /// runtime, so anything that gets past the authority fails later as
+    /// `signingUnavailable`, and a distinct reason proves the order.
+    fn authority_sign_request(issued_at_ms: u64) -> SignRequest {
+        let call_bytes = decode_hex_string(&HexString::new(TEST_CALL_BYTES_HEX).expect("call hex"))
+            .expect("call bytes");
+        let mut request = SignRequest {
+            request_id: "req-authority".to_string(),
+            call_bytes_hex: HexString::new(TEST_CALL_BYTES_HEX).expect("call hex"),
+            context: RequestContext {
+                organization_id: "org-1".to_string(),
+                application_id: "app-1".to_string(),
+                policy_digest: None,
+                policy_version_id: Some("pv-1".to_string()),
+                operation: Operation::AcurastMarketplaceDeploy,
+                max_reward_planck: Some(DecimalPlanck::new("100").expect("planck")),
+            },
+            acurast: test_runtime_expected_metadata(),
+            authority: Some(PlacementAuthority {
+                authority_version: PLACEMENT_AUTHORITY_VERSION,
+                attempt_id: "occ-1:attempt-1".to_string(),
+                authority_digest: sha256_digest(
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                ),
+                call_digest: Sha256Digest::from_bytes(&call_bytes),
+                payload_digest: sha256_digest(
+                    "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                ),
+                issued_at_ms,
+                expires_at_ms: issued_at_ms + 120_000,
+            }),
+        };
+        seal(&mut request);
+        request
+    }
+
+    fn seal(request: &mut SignRequest) {
+        let digest = placement_authority_digest(
+            &request.context,
+            request.authority.as_ref().expect("authority"),
+        )
+        .expect("digest");
+        request
+            .authority
+            .as_mut()
+            .expect("authority")
+            .authority_digest = digest;
+    }
+
+    const ISSUED_AT_MS: u64 = 1_775_000_000_000;
+
+    #[tokio::test]
+    async fn authority_refusals_come_before_any_chain_read_and_prove_no_submission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime_with_free_balance(dir.path(), Some(1_000_000), 1);
+
+        let expired = authority_sign_request(ISSUED_AT_MS);
+        let mut wrong_call = authority_sign_request(ISSUED_AT_MS);
+        wrong_call.call_bytes_hex = HexString::new("0x04010204").expect("call hex");
+        let mut wrong_payload = authority_sign_request(ISSUED_AT_MS);
+        wrong_payload.authority.as_mut().unwrap().payload_digest = sha256_digest(
+            "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        );
+        let mut foreign_attempt = authority_sign_request(ISSUED_AT_MS);
+        foreign_attempt.authority.as_mut().unwrap().attempt_id = "occ-2:attempt-1".to_string();
+        let mut malformed = authority_sign_request(ISSUED_AT_MS);
+        malformed.authority.as_mut().unwrap().authority_version = PLACEMENT_AUTHORITY_VERSION + 1;
+        seal(&mut malformed);
+
+        let cases = [
+            (
+                expired,
+                ISSUED_AT_MS + 120_000,
+                SignRejectionReason::AuthorityExpired,
+            ),
+            (
+                wrong_call,
+                ISSUED_AT_MS,
+                SignRejectionReason::AuthorityMismatch,
+            ),
+            (
+                wrong_payload,
+                ISSUED_AT_MS,
+                SignRejectionReason::AuthorityMismatch,
+            ),
+            (
+                foreign_attempt,
+                ISSUED_AT_MS,
+                SignRejectionReason::AuthorityMismatch,
+            ),
+            (
+                malformed,
+                ISSUED_AT_MS,
+                SignRejectionReason::AuthorityMalformed,
+            ),
+        ];
+        for (request, now, reason) in cases {
+            let rejection = runtime
+                .verify_reserve_submit(&request, &move || now)
+                .await
+                .expect_err("refused");
+            assert_eq!(rejection.reason, reason, "{:?}", rejection.message);
+            assert_eq!(rejection.phase, SignRejectionPhase::PreSubmit);
+        }
+        assert_eq!(runtime.chain.submit_count.load(Ordering::SeqCst), 0);
+        let ledger = runtime.spend.load().expect("ledger loads");
+        assert!(
+            ledger.reservations.is_empty(),
+            "a refused authority reserves nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_valid_authority_proceeds_to_runtime_verification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime_with_free_balance(dir.path(), Some(1_000_000), 1);
+        let request = authority_sign_request(ISSUED_AT_MS);
+        let rejection = runtime
+            .verify_reserve_submit(&request, &|| ISSUED_AT_MS + 1)
+            .await
+            .expect_err("the fake chain has no runtime");
+        assert_eq!(rejection.reason, SignRejectionReason::SigningUnavailable);
+        assert_eq!(rejection.phase, SignRejectionPhase::PreSubmit);
+    }
+
+    #[tokio::test]
+    async fn only_a_version_two_session_puts_a_phase_or_an_authority_reason_on_the_wire() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = test_runtime_with_free_balance(dir.path(), Some(1_000_000), 1);
+        let clock = || ISSUED_AT_MS + 120_000;
+
+        let rejected = |envelope: Envelope| match envelope {
+            Envelope::SignRejected(rejected) => rejected,
+            other => panic!("expected a rejection, got {other:?}"),
+        };
+
+        let v2 = rejected(
+            runtime
+                .handle_sign_request(
+                    authority_sign_request(ISSUED_AT_MS),
+                    PLACEMENT_AUTHORITY_PROTOCOL_VERSION,
+                    &clock,
+                )
+                .await,
+        );
+        assert_eq!(v2.reason, SignRejectionReason::AuthorityExpired);
+        assert_eq!(v2.phase, Some(SignRejectionPhase::PreSubmit));
+
+        let v1_with_authority = rejected(
+            runtime
+                .handle_sign_request(
+                    authority_sign_request(ISSUED_AT_MS),
+                    LEGACY_PROTOCOL_VERSION,
+                    &clock,
+                )
+                .await,
+        );
+        assert_eq!(
+            v1_with_authority.reason,
+            SignRejectionReason::OperationNotAllowed
+        );
+        assert_eq!(v1_with_authority.phase, None);
+
+        let mut legacy = authority_sign_request(ISSUED_AT_MS);
+        legacy.authority = None;
+        let v1_legacy = rejected(
+            runtime
+                .handle_sign_request(legacy, LEGACY_PROTOCOL_VERSION, &clock)
+                .await,
+        );
+        assert_eq!(v1_legacy.reason, SignRejectionReason::SigningUnavailable);
+        assert_eq!(v1_legacy.phase, None);
+        let encoded = serde_json::to_value(Envelope::SignRejected(v1_legacy)).expect("encodes");
+        assert!(encoded["payload"].get("phase").is_none());
+    }
+
+    fn attempt(id: &str) -> AttemptBinding {
+        AttemptBinding {
+            attempt_id: id.to_string(),
+            call_digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn an_attempt_is_reserved_once_across_requests_and_restarts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("spend.json");
+        let limits = SpendLimits {
+            max_reward_per_request_planck: 100,
+            spend_window_planck: 1_000,
+            spend_window_seconds: 60,
+        };
+        let ledger = SpendLedger::new(path.clone(), limits);
+        ledger
+            .reserve_attempt("r1", &attempt("a1"), 5, 100)
+            .expect("first use of the attempt");
+        assert_eq!(
+            ledger.reserve_attempt("r2", &attempt("a1"), 5, 101),
+            Err(SpendRefusal::AttemptReplayed)
+        );
+        // A daemon restart reads the same file.
+        let restarted = SpendLedger::new(path, limits);
+        assert_eq!(
+            restarted.reserve_attempt("r3", &attempt("a1"), 0, 102),
+            Err(SpendRefusal::AttemptReplayed),
+            "a non-spending call still cannot reuse the attempt"
+        );
+        restarted
+            .reserve_attempt("r4", &attempt("a2"), 5, 103)
+            .expect("a different attempt");
+    }
+
+    #[test]
+    fn an_attempt_record_outlives_a_short_spend_window_without_counting_against_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = SpendLedger::new(
+            dir.path().join("spend.json"),
+            SpendLimits {
+                max_reward_per_request_planck: 100,
+                spend_window_planck: 100,
+                spend_window_seconds: 60,
+            },
+        );
+        ledger
+            .reserve_attempt("r1", &attempt("a1"), 100, 1_000)
+            .expect("fills the window");
+        // Past the spend window but inside any authority's life: still a replay,
+        // and the old amount no longer uses the window.
+        assert_eq!(
+            ledger.reserve_attempt("r2", &attempt("a1"), 100, 1_061),
+            Err(SpendRefusal::AttemptReplayed)
+        );
+        ledger
+            .reserve_attempt("r3", &attempt("a2"), 100, 1_061)
+            .expect("the aged amount no longer counts");
+        // Once no authority could still name it, the record is gone.
+        ledger
+            .reserve_attempt(
+                "r4",
+                &attempt("a1"),
+                0,
+                1_000 + ATTEMPT_RECORD_RETENTION_SECONDS + 1,
+            )
+            .expect("a record older than any authority is pruned");
+    }
+
+    #[test]
+    fn a_ledger_written_before_attempt_ids_still_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("spend.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"reservations":[{"requestId":"old","amountPlanck":"5","reservedAtEpochSeconds":100,"confirmedAtEpochSeconds":101}]}"#,
+        )
+        .expect("write legacy ledger");
+        let ledger = SpendLedger::new(
+            path,
+            SpendLimits {
+                max_reward_per_request_planck: 100,
+                spend_window_planck: 1_000,
+                spend_window_seconds: 60,
+            },
+        );
+        ledger
+            .reserve_attempt("new", &attempt("a1"), 5, 110)
+            .expect("a legacy ledger accepts attempt reservations");
     }
 
     #[tokio::test]
