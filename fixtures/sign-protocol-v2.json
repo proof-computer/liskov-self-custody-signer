@@ -1,0 +1,31 @@
+{
+  "authorityDigest": "sha256:c7519c7f56f9668c639d077005086262120037c425e61a8943422a9791d92321",
+  "authorityVersion": 1,
+  "callBytesHex": "0x04010203",
+  "canonicalAuthorityPayload": "[\"proof.liskov.signer-placement-authority.v1\",{\"attemptId\":\"occ_1:attempt_1\",\"authorityVersion\":1,\"callDigest\":\"sha256:3ccb7ea5a2aa7bd47167b52377e168b74ed7b933f49d0a753c67b9387d46b569\",\"expiresAtMs\":1775000120000,\"issuedAtMs\":1775000000000,\"payloadDigest\":\"sha256:5555555555555555555555555555555555555555555555555555555555555555\"},{\"applicationId\":\"app_456\",\"maxRewardPlanck\":\"1000\",\"operation\":\"acurastMarketplace.deploy\",\"organizationId\":\"org_123\",\"policyDigest\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policyVersionId\":\"pv_789\"}]",
+  "domain": "proof.liskov.signer-placement-authority.v1",
+  "maxClockSkewMs": 30000,
+  "maxWindowMs": 600000,
+  "packet": "BKLG-20260820-9ldj",
+  "protocolVersions": {
+    "legacy": 1,
+    "placementAuthority": 2
+  },
+  "stableRejections": [
+    "authorityExpired",
+    "authorityMismatch",
+    "authorityMalformed",
+    "authorityReplayed",
+    "protocolUnsupported"
+  ],
+  "wire": {
+    "helloV1": "{\"type\":\"client.hello\",\"payload\":{\"protocolVersion\":1,\"signerVersion\":\"0.2.0\",\"address\":\"5FSignerAddress\",\"capabilities\":[\"sign.deployLifecycle\",\"prepare.liskovSecretsFromSecretSources\"]}}",
+    "helloV2": "{\"type\":\"client.hello\",\"payload\":{\"protocolVersion\":2,\"signerVersion\":\"0.2.0\",\"address\":\"5FSignerAddress\",\"capabilities\":[\"sign.deployLifecycle\",\"prepare.liskovSecretsFromSecretSources\"]}}",
+    "readyV2": "{\"type\":\"server.ready\",\"payload\":{\"organizationId\":\"org_123\",\"applicationId\":\"app_456\",\"address\":\"5FSignerAddress\",\"protocolVersion\":2}}",
+    "rejectedPostSubmit": "{\"type\":\"sign.rejected\",\"payload\":{\"requestId\":\"req-sign-authority\",\"reason\":\"signingUnavailable\",\"phase\":\"postSubmit\"}}",
+    "rejectedPreSubmit": "{\"type\":\"sign.rejected\",\"payload\":{\"requestId\":\"req-sign-authority\",\"reason\":\"authorityExpired\",\"phase\":\"preSubmit\"}}",
+    "signRequestV1": "{\"type\":\"sign.request\",\"payload\":{\"requestId\":\"req-sign-authority\",\"callBytesHex\":\"0x04010203\",\"context\":{\"organizationId\":\"org_123\",\"applicationId\":\"app_456\",\"policyDigest\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policyVersionId\":\"pv_789\",\"operation\":\"acurastMarketplace.deploy\",\"maxRewardPlanck\":\"1000\"},\"acurast\":{\"genesisHash\":\"0x1111111111111111111111111111111111111111111111111111111111111111\",\"specName\":\"acurast\",\"specVersion\":1000,\"transactionVersion\":25,\"metadataHash\":\"0x2222222222222222222222222222222222222222222222222222222222222222\"}}}",
+    "signRequestV2": "{\"type\":\"sign.request\",\"payload\":{\"requestId\":\"req-sign-authority\",\"callBytesHex\":\"0x04010203\",\"context\":{\"organizationId\":\"org_123\",\"applicationId\":\"app_456\",\"policyDigest\":\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policyVersionId\":\"pv_789\",\"operation\":\"acurastMarketplace.deploy\",\"maxRewardPlanck\":\"1000\"},\"acurast\":{\"genesisHash\":\"0x1111111111111111111111111111111111111111111111111111111111111111\",\"specName\":\"acurast\",\"specVersion\":1000,\"transactionVersion\":25,\"metadataHash\":\"0x2222222222222222222222222222222222222222222222222222222222222222\"},\"authority\":{\"authorityVersion\":1,\"attemptId\":\"occ_1:attempt_1\",\"authorityDigest\":\"sha256:c7519c7f56f9668c639d077005086262120037c425e61a8943422a9791d92321\",\"callDigest\":\"sha256:3ccb7ea5a2aa7bd47167b52377e168b74ed7b933f49d0a753c67b9387d46b569\",\"payloadDigest\":\"sha256:5555555555555555555555555555555555555555555555555555555555555555\",\"issuedAtMs\":1775000000000,\"expiresAtMs\":1775000120000}}}",
+    "signResult": "{\"type\":\"sign.result\",\"payload\":{\"requestId\":\"req-sign-authority\",\"txHash\":\"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}"
+  }
+}
