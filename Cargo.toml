@@ -7,7 +7,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-license = "Apache-2.0"
+license = "FSL-1.1-Apache-2.0"
 rust-version = "1.78"
 repository = "https://github.com/proof-computer/liskov-self-custody-signer"
 
