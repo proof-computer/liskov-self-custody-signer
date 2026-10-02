@@ -122,13 +122,18 @@ Relevant environment variables:
 - `LISKOV_SIGNER_CONTROL_PLANE_URL`
 - `LISKOV_SIGNER_PAIRING_TOKEN`
 - `LISKOV_SIGNER_KEYSTORE`
-- `LISKOV_SIGNER_ACURAST_RPC_URL`
-- `PROOF_ACURAST_RPC_BEARER_TOKEN`
+- `LISKOV_ACURAST_RPC_URL`
+- `LISKOV_ACURAST_RPC_TOKEN`
 - `LISKOV_SIGNER_SS58_FORMAT`
 - `LISKOV_SIGNER_MAX_REWARD_PER_REQUEST_PLANCK`
 - `LISKOV_SIGNER_TX_FEE_BUFFER_PLANCK`
 - `LISKOV_SIGNER_SPEND_WINDOW_PLANCK`
 - `LISKOV_SIGNER_SPEND_WINDOW_SECONDS`
+
+From 0.3.0 the signer reads the Acurast RPC endpoint and token as
+`LISKOV_ACURAST_RPC_URL` and `LISKOV_ACURAST_RPC_TOKEN`; v0.2.0 and earlier
+read `LISKOV_SIGNER_ACURAST_RPC_URL` and `PROOF_ACURAST_RPC_BEARER_TOKEN`
+instead.
 
 Reward caps and a positive transaction-fee buffer are required at startup. Spend
 reservations are persisted beside the keystore before signing so restarts do not

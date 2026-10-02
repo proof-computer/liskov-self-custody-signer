@@ -43,8 +43,8 @@ const PASSPHRASE_ENV: &str = "LISKOV_SELF_CUSTODY_SIGNER_PASSPHRASE";
 const CONTROL_PLANE_URL_ENV: &str = "LISKOV_SIGNER_CONTROL_PLANE_URL";
 const PAIRING_TOKEN_ENV: &str = "LISKOV_SIGNER_PAIRING_TOKEN";
 const KEYSTORE_PATH_ENV: &str = "LISKOV_SIGNER_KEYSTORE";
-const ACURAST_RPC_URL_ENV: &str = "LISKOV_SIGNER_ACURAST_RPC_URL";
-const ACURAST_RPC_BEARER_TOKEN_ENV: &str = "PROOF_ACURAST_RPC_BEARER_TOKEN";
+const ACURAST_RPC_URL_ENV: &str = "LISKOV_ACURAST_RPC_URL";
+const ACURAST_RPC_TOKEN_ENV: &str = "LISKOV_ACURAST_RPC_TOKEN";
 const MAX_REWARD_ENV: &str = "LISKOV_SIGNER_MAX_REWARD_PER_REQUEST_PLANCK";
 const TX_FEE_BUFFER_PLANCK_ENV: &str = "LISKOV_SIGNER_TX_FEE_BUFFER_PLANCK";
 const SPEND_WINDOW_PLANCK_ENV: &str = "LISKOV_SIGNER_SPEND_WINDOW_PLANCK";
@@ -789,34 +789,41 @@ impl RunConfig {
 }
 
 fn apply_env(file: &mut FileConfig) -> Result<(), SignerError> {
-    if let Ok(value) = std::env::var(CONTROL_PLANE_URL_ENV) {
+    apply_env_from(file, |name| std::env::var(name).ok())
+}
+
+fn apply_env_from(
+    file: &mut FileConfig,
+    read: impl Fn(&str) -> Option<String>,
+) -> Result<(), SignerError> {
+    if let Some(value) = read(CONTROL_PLANE_URL_ENV) {
         file.control_plane_url = Some(value);
     }
-    if let Ok(value) = std::env::var(PAIRING_TOKEN_ENV) {
+    if let Some(value) = read(PAIRING_TOKEN_ENV) {
         file.pairing_token = Some(value);
     }
-    if let Ok(value) = std::env::var(KEYSTORE_PATH_ENV) {
+    if let Some(value) = read(KEYSTORE_PATH_ENV) {
         file.keystore_path = Some(PathBuf::from(value));
     }
-    if let Ok(value) = std::env::var(ACURAST_RPC_URL_ENV) {
+    if let Some(value) = read(ACURAST_RPC_URL_ENV) {
         file.acurast_rpc_url = Some(value);
     }
-    if let Ok(value) = std::env::var(ACURAST_RPC_BEARER_TOKEN_ENV) {
+    if let Some(value) = read(ACURAST_RPC_TOKEN_ENV) {
         file.acurast_rpc_bearer_token = Some(value);
     }
-    if let Ok(value) = std::env::var(SS58_FORMAT_ENV) {
+    if let Some(value) = read(SS58_FORMAT_ENV) {
         file.ss58_format = Some(parse_env(value, SS58_FORMAT_ENV)?);
     }
-    if let Ok(value) = std::env::var(MAX_REWARD_ENV) {
+    if let Some(value) = read(MAX_REWARD_ENV) {
         file.max_reward_per_request_planck = Some(parse_env(value, MAX_REWARD_ENV)?);
     }
-    if let Ok(value) = std::env::var(TX_FEE_BUFFER_PLANCK_ENV) {
+    if let Some(value) = read(TX_FEE_BUFFER_PLANCK_ENV) {
         file.tx_fee_buffer_planck = Some(parse_env(value, TX_FEE_BUFFER_PLANCK_ENV)?);
     }
-    if let Ok(value) = std::env::var(SPEND_WINDOW_PLANCK_ENV) {
+    if let Some(value) = read(SPEND_WINDOW_PLANCK_ENV) {
         file.spend_window_planck = Some(parse_env(value, SPEND_WINDOW_PLANCK_ENV)?);
     }
-    if let Ok(value) = std::env::var(SPEND_WINDOW_SECONDS_ENV) {
+    if let Some(value) = read(SPEND_WINDOW_SECONDS_ENV) {
         file.spend_window_seconds = Some(parse_env(value, SPEND_WINDOW_SECONDS_ENV)?);
     }
     Ok(())
@@ -1926,13 +1933,13 @@ fn redacted(value: Option<&str>) -> &str {
 }
 
 fn sanitize_error(error: &str) -> String {
+    sanitize_error_from(error, |name| std::env::var(name).ok())
+}
+
+fn sanitize_error_from(error: &str, read: impl Fn(&str) -> Option<String>) -> String {
     let mut sanitized = error.to_string();
-    for name in [
-        PASSPHRASE_ENV,
-        PAIRING_TOKEN_ENV,
-        ACURAST_RPC_BEARER_TOKEN_ENV,
-    ] {
-        if let Ok(value) = std::env::var(name) {
+    for name in [PASSPHRASE_ENV, PAIRING_TOKEN_ENV, ACURAST_RPC_TOKEN_ENV] {
+        if let Some(value) = read(name) {
             if !value.is_empty() {
                 sanitized = sanitized.replace(&value, "<redacted>");
             }
@@ -3064,6 +3071,119 @@ mod tests {
         assert_eq!(
             acurast_rpc_provider_url("https://example.test", Some("secret")),
             "https://example.test"
+        );
+    }
+
+    const APPLY_ENV_NAMES: [&str; 10] = [
+        CONTROL_PLANE_URL_ENV,
+        PAIRING_TOKEN_ENV,
+        KEYSTORE_PATH_ENV,
+        ACURAST_RPC_URL_ENV,
+        ACURAST_RPC_TOKEN_ENV,
+        SS58_FORMAT_ENV,
+        MAX_REWARD_ENV,
+        TX_FEE_BUFFER_PLANCK_ENV,
+        SPEND_WINDOW_PLANCK_ENV,
+        SPEND_WINDOW_SECONDS_ENV,
+    ];
+
+    fn env_reader<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    // Answers every name except the ones `apply_env` reads, so the retired
+    // names (and any other) are covered without spelling them in source.
+    fn every_other_name_reader(value: &str) -> impl Fn(&str) -> Option<String> + '_ {
+        move |name| (!APPLY_ENV_NAMES.contains(&name)).then(|| value.to_string())
+    }
+
+    #[test]
+    fn apply_env_reads_acurast_rpc_token_as_liskov_name() {
+        let mut file = FileConfig::default();
+        apply_env_from(&mut file, env_reader(&[("LISKOV_ACURAST_RPC_TOKEN", "t")])).unwrap();
+        assert_eq!(file.acurast_rpc_bearer_token.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn apply_env_ignores_any_other_acurast_rpc_token_name() {
+        let mut file = FileConfig::default();
+        apply_env_from(&mut file, every_other_name_reader("old")).unwrap();
+        assert_eq!(file.acurast_rpc_bearer_token, None);
+    }
+
+    #[test]
+    fn apply_env_reads_acurast_rpc_url_as_liskov_name() {
+        let mut file = FileConfig::default();
+        apply_env_from(
+            &mut file,
+            env_reader(&[("LISKOV_ACURAST_RPC_URL", "wss://rpc.example.test")]),
+        )
+        .unwrap();
+        assert_eq!(
+            file.acurast_rpc_url.as_deref(),
+            Some("wss://rpc.example.test")
+        );
+    }
+
+    #[test]
+    fn apply_env_ignores_any_other_acurast_rpc_url_name() {
+        let mut file = FileConfig::default();
+        apply_env_from(&mut file, every_other_name_reader("wss://old.example.test")).unwrap();
+        assert_eq!(file.acurast_rpc_url, None);
+    }
+
+    #[test]
+    fn apply_env_fills_every_field_from_its_name() {
+        let mut file = FileConfig::default();
+        apply_env_from(
+            &mut file,
+            env_reader(&[
+                (
+                    "LISKOV_SIGNER_CONTROL_PLANE_URL",
+                    "wss://control.example.test",
+                ),
+                ("LISKOV_SIGNER_PAIRING_TOKEN", "pairing"),
+                ("LISKOV_SIGNER_KEYSTORE", "signer.json"),
+                ("LISKOV_ACURAST_RPC_URL", "wss://rpc.example.test"),
+                ("LISKOV_ACURAST_RPC_TOKEN", "t"),
+                ("LISKOV_SIGNER_SS58_FORMAT", "42"),
+                ("LISKOV_SIGNER_MAX_REWARD_PER_REQUEST_PLANCK", "100"),
+                ("LISKOV_SIGNER_TX_FEE_BUFFER_PLANCK", "7"),
+                ("LISKOV_SIGNER_SPEND_WINDOW_PLANCK", "1000"),
+                ("LISKOV_SIGNER_SPEND_WINDOW_SECONDS", "3600"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            file.control_plane_url.as_deref(),
+            Some("wss://control.example.test")
+        );
+        assert_eq!(file.pairing_token.as_deref(), Some("pairing"));
+        assert_eq!(file.keystore_path, Some(PathBuf::from("signer.json")));
+        assert_eq!(
+            file.acurast_rpc_url.as_deref(),
+            Some("wss://rpc.example.test")
+        );
+        assert_eq!(file.acurast_rpc_bearer_token.as_deref(), Some("t"));
+        assert_eq!(file.ss58_format, Some(42));
+        assert_eq!(file.max_reward_per_request_planck, Some(100));
+        assert_eq!(file.tx_fee_buffer_planck, Some(7));
+        assert_eq!(file.spend_window_planck, Some(1000));
+        assert_eq!(file.spend_window_seconds, Some(3600));
+    }
+
+    #[test]
+    fn sanitize_error_redacts_acurast_rpc_token() {
+        assert_eq!(
+            sanitize_error_from(
+                "boom s3cr3t",
+                env_reader(&[("LISKOV_ACURAST_RPC_TOKEN", "s3cr3t")])
+            ),
+            "boom <redacted>"
         );
     }
 
