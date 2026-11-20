@@ -185,7 +185,7 @@ cargo test --workspace --all-features --locked
 
 From version `0.3.0`, this repository is licensed under the Functional Source
 License, Version 1.1, with Apache 2.0 as the future license
-(SPDX `FSL-1.1-Apache-2.0`); see [`LICENSE`](LICENSE). The licensor is
+(SPDX `FSL-1.1-ALv2`); see [`LICENSE`](LICENSE). The licensor is
 Moose Labs Ltd.
 
 You may use, copy, modify, build and redistribute the signer for any purpose
