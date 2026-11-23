@@ -30,4 +30,5 @@ zeroize.workspace = true
 
 [dev-dependencies]
 clap.workspace = true
+scale-info = "2.11.6"
 tempfile.workspace = true

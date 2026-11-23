@@ -151,6 +151,11 @@ accepts only:
 - `acurast.setEnvironments`
 - `acurast.deregister`
 
+The daemon picks up Acurast runtime upgrades without a restart. If the spec
+version, transaction version, or metadata hash differs, it re-reads the
+runtime from its Acurast RPC once and compares again. It refuses signing
+when the request and the chain still disagree or the runtime read fails.
+
 `Balances::transfer` and all other value-movement calls are deliberately
 excluded. `register` and `deploy` must also fit the per-slot request cap; their
 total reward escrow (`reward * slots`) must fit the local per-request cap and
