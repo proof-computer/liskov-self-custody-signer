@@ -3,6 +3,7 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -28,8 +29,14 @@ use schnorrkel::{ExpansionMode, MiniSecretKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subxt::{
+    backend::{
+        legacy::{LegacyBackend, LegacyRpcMethods},
+        rpc::RpcClient,
+        Backend, BackendExt,
+    },
+    client::RuntimeVersion,
     tx::{Payload, Signer},
-    utils::{AccountId32, MultiAddress, MultiSignature},
+    utils::{AccountId32, MultiAddress, MultiSignature, H256},
     Metadata, OnlineClient, PolkadotConfig,
 };
 use thiserror::Error;
@@ -544,12 +551,8 @@ where
             }
             None => None,
         };
-        let runtime = self
-            .chain
-            .runtime_snapshot()
-            .await
-            .map_err(|error| Rejection::signing_unavailable(&error))?;
-        let verified = verify_sign_request(request, &runtime)?;
+        let runtime = self.matching_runtime(&request.acurast).await?;
+        let verified = verify_call(request, &runtime.metadata)?;
         self.ensure_acu_balance_preflight(&verified).await?;
         // The RPC reads above can be slow. An authority that lapsed while we
         // waited on them is not signed.
@@ -605,6 +608,30 @@ where
                 None
             },
         })
+    }
+
+    async fn matching_runtime(
+        &self,
+        expected: &AcurastRuntimeMetadata,
+    ) -> Result<RuntimeSnapshot, Rejection> {
+        let cached = self
+            .chain
+            .runtime_snapshot()
+            .await
+            .map_err(|error| Rejection::signing_unavailable(&error))?;
+        match compare_runtime_metadata(expected, &cached) {
+            Ok(()) => Ok(cached),
+            Err(RuntimeMismatch::Drift(_)) => {
+                let fresh = self
+                    .chain
+                    .refresh_runtime()
+                    .await
+                    .map_err(|error| Rejection::signing_unavailable(&error))?;
+                compare_runtime_metadata(expected, &fresh).map_err(Rejection::from)?;
+                Ok(fresh)
+            }
+            Err(mismatch) => Err(mismatch.into()),
+        }
     }
 
     async fn ensure_acu_balance_preflight(&self, verified: &VerifiedCall) -> Result<(), Rejection> {
@@ -1355,6 +1382,8 @@ pub struct SubmittedTransaction {
 #[async_trait]
 pub trait AcurastClient: Send + Sync {
     async fn runtime_snapshot(&self) -> Result<RuntimeSnapshot, String>;
+    /// Re-read the runtime and update the runtime used to sign subsequent calls.
+    async fn refresh_runtime(&self) -> Result<RuntimeSnapshot, String>;
     async fn free_balance_planck(&self, account: &AccountId32) -> Result<Option<u128>, String>;
     async fn submit_call(
         &self,
@@ -1365,39 +1394,119 @@ pub trait AcurastClient: Send + Sync {
 
 pub struct LiveAcurastClient {
     client: OnlineClient<PolkadotConfig>,
+    rpc: LegacyRpcMethods<PolkadotConfig>,
 }
 
 impl LiveAcurastClient {
     pub async fn connect(rpc_url: &str, token: Option<&str>) -> Result<Self, SignerError> {
-        use subxt::backend::rpc::reconnecting_rpc_client::{ExponentialBackoff, RpcClient};
+        use subxt::backend::rpc::reconnecting_rpc_client::{
+            ExponentialBackoff, RpcClient as ReconnectingRpcClient,
+        };
         let url = acurast_rpc_provider_url(rpc_url, token);
-        let rpc = RpcClient::builder()
+        let rpc = ReconnectingRpcClient::builder()
             .retry_policy(ExponentialBackoff::from_millis(200).max_delay(Duration::from_secs(30)))
             .build(url)
             .await
             .map_err(|error| SignerError::Rpc(format!("Acurast RPC connect failed: {error}")))?;
-        let client = OnlineClient::<PolkadotConfig>::from_rpc_client(rpc)
+        let rpc = RpcClient::from(rpc);
+        let methods = LegacyRpcMethods::new(rpc.clone());
+        let backend = Arc::new(LegacyBackend::builder().build(rpc));
+        let (genesis_hash, version, metadata) = read_acurast_runtime(&methods, backend.as_ref())
             .await
+            .map_err(SignerError::Rpc)?;
+        let client = OnlineClient::from_backend_with(genesis_hash, version, metadata, backend)
             .map_err(|error| {
                 SignerError::Rpc(format!("Acurast RPC client init failed: {error}"))
             })?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            rpc: methods,
+        })
     }
+}
+
+async fn read_acurast_runtime(
+    rpc: &LegacyRpcMethods<PolkadotConfig>,
+    backend: &dyn Backend<PolkadotConfig>,
+) -> Result<(H256, RuntimeVersion, Metadata), String> {
+    let genesis_hash = backend
+        .genesis_hash()
+        .await
+        .map_err(|_| "Acurast genesis hash read failed")?;
+    // Read both values at one block so an upgrade between RPC calls cannot
+    // pair metadata from one runtime with the signing version of another.
+    let at = rpc
+        .chain_get_block_hash(None)
+        .await
+        .map_err(|_| "Acurast best block hash read failed")?
+        .ok_or("Acurast best block hash is unavailable")?;
+    let version = rpc
+        .state_get_runtime_version(Some(at))
+        .await
+        .map_err(|_| "Acurast runtime version read failed")?;
+    // Use Subxt's metadata preference for stable runtimes.
+    let metadata = match backend.metadata_at_version(15, at).await {
+        Ok(metadata) => metadata,
+        Err(_) => backend
+            .legacy_metadata(at)
+            .await
+            .map_err(|_| "Acurast runtime metadata read failed")?,
+    };
+    Ok((
+        genesis_hash,
+        RuntimeVersion {
+            spec_version: version.spec_version,
+            transaction_version: version.transaction_version,
+        },
+        metadata,
+    ))
 }
 
 #[async_trait]
 impl AcurastClient for LiveAcurastClient {
     async fn runtime_snapshot(&self) -> Result<RuntimeSnapshot, String> {
-        let runtime = self.client.runtime_version();
-        let metadata = self.client.metadata();
+        let client = self.client.offline();
+        let runtime = client.runtime_version();
+        let metadata = client.metadata();
         Ok(RuntimeSnapshot {
-            genesis_hash_hex: format!("0x{}", hex::encode(self.client.genesis_hash().0)),
+            genesis_hash_hex: format!("0x{}", hex::encode(client.genesis_hash().0)),
             spec_name: "acurast".to_string(),
             spec_version: runtime.spec_version,
             transaction_version: runtime.transaction_version,
             metadata_hash_hex: metadata_hash_hex(&metadata),
             metadata,
         })
+    }
+
+    async fn refresh_runtime(&self) -> Result<RuntimeSnapshot, String> {
+        let (genesis_hash, version, metadata) =
+            read_acurast_runtime(&self.rpc, self.client.backend()).await?;
+        if genesis_hash != self.client.genesis_hash() {
+            return Err("Acurast RPC genesis hash changed".to_string());
+        }
+        let old = self.runtime_snapshot().await?;
+        // The daemon handles requests serially and signs with this same client.
+        self.client.set_runtime_version(version);
+        self.client.set_metadata(metadata);
+        let fresh = self.runtime_snapshot().await?;
+        if old.spec_version != fresh.spec_version
+            || old.transaction_version != fresh.transaction_version
+            || old.metadata_hash_hex != fresh.metadata_hash_hex
+        {
+            eprintln!(
+                "{}",
+                json!({
+                    "level": "info",
+                    "component": "liskov-self-custody-signer",
+                    "message": "Acurast runtime updated",
+                    "oldSpecVersion": old.spec_version,
+                    "newSpecVersion": fresh.spec_version,
+                    "oldTransactionVersion": old.transaction_version,
+                    "newTransactionVersion": fresh.transaction_version,
+                })
+            );
+        }
+        Ok(fresh)
     }
 
     async fn free_balance_planck(&self, account: &AccountId32) -> Result<Option<u128>, String> {
@@ -1509,10 +1618,14 @@ pub fn verify_sign_request(
     request: &SignRequest,
     runtime: &RuntimeSnapshot,
 ) -> Result<VerifiedCall, Rejection> {
-    compare_runtime_metadata(&request.acurast, runtime)?;
+    compare_runtime_metadata(&request.acurast, runtime).map_err(Rejection::from)?;
+    verify_call(request, &runtime.metadata)
+}
+
+fn verify_call(request: &SignRequest, metadata: &Metadata) -> Result<VerifiedCall, Rejection> {
     let call_bytes = decode_hex_string(&request.call_bytes_hex)
         .map_err(|_| Rejection::new(SignRejectionReason::InvalidCallBytes, "bad callBytesHex"))?;
-    let decoded = decode_call(&runtime.metadata, &call_bytes)?;
+    let decoded = decode_call(metadata, &call_bytes)?;
     if decoded.operation != request.context.operation {
         return Err(Rejection::new(
             SignRejectionReason::OperationNotAllowed,
@@ -1595,7 +1708,7 @@ fn verify_reward_terms(
 fn compare_runtime_metadata(
     expected: &AcurastRuntimeMetadata,
     actual: &RuntimeSnapshot,
-) -> Result<(), Rejection> {
+) -> Result<(), RuntimeMismatch> {
     compare_runtime_metadata_fields(
         expected,
         RuntimeMetadataFields {
@@ -1617,45 +1730,46 @@ struct RuntimeMetadataFields<'a> {
     metadata_hash_hex: &'a str,
 }
 
+#[derive(Debug)]
+enum RuntimeMismatch {
+    Identity(&'static str),
+    Drift(&'static str),
+    MissingMetadataHash,
+}
+
+impl From<RuntimeMismatch> for Rejection {
+    fn from(mismatch: RuntimeMismatch) -> Self {
+        let message = match mismatch {
+            RuntimeMismatch::Identity(message) | RuntimeMismatch::Drift(message) => message,
+            RuntimeMismatch::MissingMetadataHash => "Acurast metadata hash is required",
+        };
+        Self::new(SignRejectionReason::MetadataMismatch, message)
+    }
+}
+
 fn compare_runtime_metadata_fields(
     expected: &AcurastRuntimeMetadata,
     actual: RuntimeMetadataFields<'_>,
-) -> Result<(), Rejection> {
+) -> Result<(), RuntimeMismatch> {
     if expected.genesis_hash.as_str() != actual.genesis_hash_hex {
-        return Err(Rejection::new(
-            SignRejectionReason::MetadataMismatch,
-            "Acurast genesis hash mismatch",
-        ));
+        return Err(RuntimeMismatch::Identity("Acurast genesis hash mismatch"));
     }
     if expected.spec_name != actual.spec_name {
-        return Err(Rejection::new(
-            SignRejectionReason::MetadataMismatch,
-            "Acurast spec name mismatch",
-        ));
+        return Err(RuntimeMismatch::Identity("Acurast spec name mismatch"));
     }
     if expected.spec_version != actual.spec_version {
-        return Err(Rejection::new(
-            SignRejectionReason::MetadataMismatch,
-            "Acurast spec version mismatch",
-        ));
+        return Err(RuntimeMismatch::Drift("Acurast spec version mismatch"));
     }
     if expected.transaction_version != actual.transaction_version {
-        return Err(Rejection::new(
-            SignRejectionReason::MetadataMismatch,
+        return Err(RuntimeMismatch::Drift(
             "Acurast transaction version mismatch",
         ));
     }
     let Some(hash) = &expected.metadata_hash else {
-        return Err(Rejection::new(
-            SignRejectionReason::MetadataMismatch,
-            "Acurast metadata hash is required",
-        ));
+        return Err(RuntimeMismatch::MissingMetadataHash);
     };
     if hash.as_str() != actual.metadata_hash_hex {
-        return Err(Rejection::new(
-            SignRejectionReason::MetadataMismatch,
-            "Acurast metadata hash mismatch",
-        ));
+        return Err(RuntimeMismatch::Drift("Acurast metadata hash mismatch"));
     }
     Ok(())
 }
@@ -2115,8 +2229,10 @@ mod tests {
         expected: &AcurastRuntimeMetadata,
         actual: RuntimeMetadataFields<'_>,
     ) -> String {
-        let rejection = compare_runtime_metadata_fields(expected, actual)
-            .expect_err("metadata mismatch rejected");
+        let rejection = Rejection::from(
+            compare_runtime_metadata_fields(expected, actual)
+                .expect_err("metadata mismatch rejected"),
+        );
         assert_eq!(rejection.reason, SignRejectionReason::MetadataMismatch);
         rejection.message.expect("message")
     }
@@ -2124,6 +2240,9 @@ mod tests {
     struct FakeAcurastClient {
         free_balance: Option<u128>,
         submit_count: Arc<AtomicUsize>,
+        cached_runtime: Option<RuntimeSnapshot>,
+        refreshed_runtime: Option<RuntimeSnapshot>,
+        refresh_count: AtomicUsize,
     }
 
     impl FakeAcurastClient {
@@ -2131,6 +2250,9 @@ mod tests {
             Self {
                 free_balance,
                 submit_count: Arc::new(AtomicUsize::new(0)),
+                cached_runtime: None,
+                refreshed_runtime: None,
+                refresh_count: AtomicUsize::new(0),
             }
         }
     }
@@ -2138,7 +2260,16 @@ mod tests {
     #[async_trait]
     impl AcurastClient for FakeAcurastClient {
         async fn runtime_snapshot(&self) -> Result<RuntimeSnapshot, String> {
-            Err("runtime snapshot not configured for this test".to_string())
+            self.cached_runtime
+                .clone()
+                .ok_or_else(|| "runtime snapshot not configured for this test".to_string())
+        }
+
+        async fn refresh_runtime(&self) -> Result<RuntimeSnapshot, String> {
+            self.refresh_count.fetch_add(1, Ordering::SeqCst);
+            self.refreshed_runtime
+                .clone()
+                .ok_or_else(|| "runtime refresh RPC failed".to_string())
         }
 
         async fn free_balance_planck(
@@ -2504,6 +2635,197 @@ mod tests {
             .expect_err("the fake chain has no runtime");
         assert_eq!(rejection.reason, SignRejectionReason::SigningUnavailable);
         assert_eq!(rejection.phase, SignRejectionPhase::PreSubmit);
+    }
+
+    fn runtime_refresh_fixture() -> (RuntimeSnapshot, SignRequest) {
+        use scale_info::meta_type;
+        use subxt::ext::frame_metadata::{
+            v15::{CustomMetadata, ExtrinsicMetadata, OuterEnums, RuntimeMetadataV15},
+            RuntimeMetadataPrefixed,
+        };
+
+        let unit = meta_type::<()>();
+        let metadata = RuntimeMetadataV15::new(
+            Vec::new(),
+            ExtrinsicMetadata {
+                version: 4,
+                address_ty: unit,
+                call_ty: unit,
+                signature_ty: unit,
+                extra_ty: unit,
+                signed_extensions: Vec::new(),
+            },
+            unit,
+            Vec::new(),
+            OuterEnums {
+                call_enum_ty: unit,
+                event_enum_ty: unit,
+                error_enum_ty: unit,
+            },
+            CustomMetadata {
+                map: Default::default(),
+            },
+        );
+        let metadata =
+            Metadata::try_from(RuntimeMetadataPrefixed::from(metadata)).expect("runtime metadata");
+        let metadata_hash_hex = metadata_hash_hex(&metadata);
+        let mut request = authority_sign_request(ISSUED_AT_MS);
+        request.acurast.metadata_hash =
+            Some(HexString::new(metadata_hash_hex.clone()).expect("metadata hash"));
+        let cached = RuntimeSnapshot {
+            genesis_hash_hex: request.acurast.genesis_hash.to_string(),
+            spec_name: request.acurast.spec_name.clone(),
+            spec_version: request.acurast.spec_version,
+            transaction_version: request.acurast.transaction_version,
+            metadata_hash_hex,
+            metadata,
+        };
+        (cached, request)
+    }
+
+    #[tokio::test]
+    async fn runtime_refresh_reaches_call_verification_after_a_spec_upgrade() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut daemon = test_runtime_with_free_balance(dir.path(), Some(1_000_000), 1);
+        let (cached, mut request) = runtime_refresh_fixture();
+        request.acurast.spec_version += 1;
+        let stale_rejection = verify_sign_request(&request, &cached).expect_err("stale spec");
+        assert_eq!(
+            stale_rejection,
+            Rejection::new(
+                SignRejectionReason::MetadataMismatch,
+                "Acurast spec version mismatch"
+            )
+        );
+        daemon.chain.cached_runtime = Some(cached.clone());
+        daemon.chain.refreshed_runtime = Some(RuntimeSnapshot {
+            spec_version: request.acurast.spec_version,
+            ..cached
+        });
+
+        let rejection = daemon
+            .verify_reserve_submit(&request, &|| ISSUED_AT_MS + 1)
+            .await
+            .expect_err("the test metadata has no call pallets");
+
+        assert_eq!(daemon.chain.refresh_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rejection,
+            Rejection::new(
+                SignRejectionReason::OperationNotAllowed,
+                "unknown call pallet index"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_refresh_still_rejects_drift_before_reservation_or_submission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut daemon = test_runtime_with_free_balance(dir.path(), Some(1_000_000), 1);
+        let (cached, mut request) = runtime_refresh_fixture();
+        request.acurast.spec_version += 1;
+        request.acurast.transaction_version += 1;
+        daemon.chain.cached_runtime = Some(cached.clone());
+        daemon.chain.refreshed_runtime = Some(RuntimeSnapshot {
+            spec_version: request.acurast.spec_version,
+            ..cached
+        });
+
+        let rejection = daemon
+            .verify_reserve_submit(&request, &|| ISSUED_AT_MS + 1)
+            .await
+            .expect_err("the refreshed transaction version still differs");
+
+        assert_eq!(daemon.chain.refresh_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rejection,
+            Rejection::new(
+                SignRejectionReason::MetadataMismatch,
+                "Acurast transaction version mismatch",
+            )
+        );
+        assert_eq!(daemon.chain.submit_count.load(Ordering::SeqCst), 0);
+        assert!(!daemon
+            .spend
+            .path
+            .try_exists()
+            .expect("spend ledger presence"));
+    }
+
+    #[tokio::test]
+    async fn runtime_refresh_is_skipped_when_the_cached_runtime_matches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut daemon = test_runtime_with_free_balance(dir.path(), Some(1_000_000), 1);
+        let (cached, request) = runtime_refresh_fixture();
+        daemon.chain.cached_runtime = Some(cached);
+
+        let rejection = daemon
+            .verify_reserve_submit(&request, &|| ISSUED_AT_MS + 1)
+            .await
+            .expect_err("the test metadata has no call pallets");
+
+        assert_eq!(daemon.chain.refresh_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            rejection,
+            Rejection::new(
+                SignRejectionReason::OperationNotAllowed,
+                "unknown call pallet index"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_refresh_is_skipped_for_a_genesis_hash_or_spec_name_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut daemon = test_runtime_with_free_balance(dir.path(), Some(1_000_000), 1);
+        let (cached, request) = runtime_refresh_fixture();
+        daemon.chain.cached_runtime = Some(cached);
+        let mut wrong_genesis = request.clone();
+        wrong_genesis.acurast.genesis_hash =
+            HexString::new(format!("0x{}", "ff".repeat(32))).expect("different genesis hash");
+        let mut wrong_name = request;
+        wrong_name.acurast.spec_name = "acurast-next".to_string();
+
+        for (request, message) in [
+            (wrong_genesis, "Acurast genesis hash mismatch"),
+            (wrong_name, "Acurast spec name mismatch"),
+        ] {
+            let rejection = daemon
+                .verify_reserve_submit(&request, &|| ISSUED_AT_MS + 1)
+                .await
+                .expect_err("the request names another chain");
+            assert_eq!(
+                rejection,
+                Rejection::new(SignRejectionReason::MetadataMismatch, message)
+            );
+        }
+        assert_eq!(daemon.chain.refresh_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_refresh_failure_refuses_before_submission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut daemon = test_runtime_with_free_balance(dir.path(), Some(1_000_000), 1);
+        let (cached, mut request) = runtime_refresh_fixture();
+        request.acurast.transaction_version += 1;
+        daemon.chain.cached_runtime = Some(cached);
+
+        let rejection = daemon
+            .verify_reserve_submit(&request, &|| ISSUED_AT_MS + 1)
+            .await
+            .expect_err("refresh RPC is unavailable");
+
+        assert_eq!(daemon.chain.refresh_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rejection,
+            Rejection::signing_unavailable("runtime refresh RPC failed")
+        );
+        assert_eq!(daemon.chain.submit_count.load(Ordering::SeqCst), 0);
+        assert!(!daemon
+            .spend
+            .path
+            .try_exists()
+            .expect("spend ledger presence"));
     }
 
     #[tokio::test]
