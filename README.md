@@ -10,23 +10,23 @@ finalized transaction result.
 
 ## Install
 
-Download the `v0.2.0` release for your platform from
-<https://github.com/proof-computer/liskov-self-custody-signer/releases/tag/v0.2.0>.
+Download the `v0.3.0` release for your platform from
+<https://github.com/proof-computer/liskov-self-custody-signer/releases/tag/v0.3.0>.
 Each release includes four archives plus `SHA256SUMS`:
 
-- `liskov-self-custody-signer-v0.2.0-x86_64-unknown-linux-gnu.tar.gz`
-- `liskov-self-custody-signer-v0.2.0-x86_64-apple-darwin.tar.gz`
-- `liskov-self-custody-signer-v0.2.0-aarch64-apple-darwin.tar.gz`
-- `liskov-self-custody-signer-v0.2.0-x86_64-pc-windows-msvc.zip`
+- `liskov-self-custody-signer-v0.3.0-x86_64-unknown-linux-gnu.tar.gz`
+- `liskov-self-custody-signer-v0.3.0-x86_64-apple-darwin.tar.gz`
+- `liskov-self-custody-signer-v0.3.0-aarch64-apple-darwin.tar.gz`
+- `liskov-self-custody-signer-v0.3.0-x86_64-pc-windows-msvc.zip`
 
 Verify the archive against the published checksums before running it:
 
 ```sh
-curl -fsSL -O https://github.com/proof-computer/liskov-self-custody-signer/releases/download/v0.2.0/SHA256SUMS
-curl -fsSL -O https://github.com/proof-computer/liskov-self-custody-signer/releases/download/v0.2.0/liskov-self-custody-signer-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+curl -fsSL -O https://github.com/proof-computer/liskov-self-custody-signer/releases/download/v0.3.0/SHA256SUMS
+curl -fsSL -O https://github.com/proof-computer/liskov-self-custody-signer/releases/download/v0.3.0/liskov-self-custody-signer-v0.3.0-x86_64-unknown-linux-gnu.tar.gz
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf liskov-self-custody-signer-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
-./liskov-self-custody-signer-v0.2.0-x86_64-unknown-linux-gnu/liskov-self-custody-signer --version
+tar -xzf liskov-self-custody-signer-v0.3.0-x86_64-unknown-linux-gnu.tar.gz
+./liskov-self-custody-signer-v0.3.0-x86_64-unknown-linux-gnu/liskov-self-custody-signer --version
 ```
 
 `--version` prints `0.2.0` plus the git sha baked into that build.
@@ -86,7 +86,7 @@ logged or written outside the encrypted keystore.
 
 ## Run
 
-The flat command printed by `proof liskov custody pair` is still supported:
+The flat command printed by `proof liskov application signer pair APP` is still supported:
 
 ```sh
 liskov-self-custody-signer \
